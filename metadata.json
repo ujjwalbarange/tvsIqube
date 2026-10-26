@@ -1,0 +1,6 @@
+{
+  "name": "iQube Cockpit",
+  "description": "Open-source BLE telemetry dashboard, packet inspector, and cluster command controller for the TVS iQube electric scooter.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
