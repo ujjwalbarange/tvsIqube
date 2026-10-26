@@ -29,6 +29,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.example.model.ByteOffsetMapping
+import com.example.model.IqubeBleSpec
 import com.example.model.TelemetryState
 import com.example.model.toAsciiPreview
 import com.example.model.toHexString
@@ -41,6 +42,7 @@ import com.example.ui.theme.SlateCardElevated
 import com.example.ui.theme.SlateSurface
 import com.example.ui.theme.TextPrimary
 import com.example.ui.theme.TextSecondary
+import java.util.Locale
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -67,7 +69,39 @@ fun HexInspectorScreen(
                 .widthIn(max = 680.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
-            // 1. Live 20-Byte Hex & ASCII Stream Monitor (Handle 0x001E / 0x5354)
+            // 1. Exact GATT Service & Characteristic UUID Reference Card
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(SlateSurface)
+                    .border(1.dp, SlateBorder, RoundedCornerShape(16.dp))
+                    .padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                Text(
+                    text = "VERIFIED GATT SERVICE & CHARACTERISTIC UUIDs (btsnoop_hci.log)",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = NeonMint
+                )
+                Text(
+                    text = "Advertised Name: ${IqubeBleSpec.ADVERTISED_BLE_NAME}  |  Vehicle ID (0x7D): ${telemetry.vehicleIdString ?: IqubeBleSpec.CLUSTER_VEHICLE_ID_DEFAULT}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = TextPrimary
+                )
+                Text(
+                    text = "Primary Service (0x001C..0xFFFF): ${IqubeBleSpec.SERVICE_UUID_SMARTXONNECT} (\"${IqubeBleSpec.SERVICE_UUID_ASCII}\")",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = ElectricCyan
+                )
+                Text(
+                    text = "Notify (0x001E): 0x5354 (\"ST\")  •  Write (0x0022): 0x5352 (\"SR\")  •  Trailer: Byte 19 = 0xFF",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = AmberWarning
+                )
+            }
+
+            // 2. Live 20-Byte Hex & ASCII Stream Monitor (Handle 0x001E / 0x5354)
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -84,12 +118,12 @@ fun HexInspectorScreen(
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
                         Text(
-                            text = "LIVE 20-BYTE BINARY STREAM (HANDLE 0x001E / 0x5354)",
+                            text = "LIVE 20-BYTE UNFILTERED STREAM (0x5354 / HANDLE 0x001E)",
                             style = MaterialTheme.typography.labelMedium,
                             color = ElectricCyan
                         )
                         Text(
-                            text = "Malformed / Resynced Chunks: ${telemetry.malformedPacketCount}",
+                            text = "Malformed / Resynced Chunks: ${telemetry.malformedPacketCount} • Every frame ends with Byte 19 = 0xFF",
                             style = MaterialTheme.typography.labelSmall,
                             color = TextSecondary
                         )
@@ -109,36 +143,36 @@ fun HexInspectorScreen(
                 }
 
                 HexFrameInspectorRow(
-                    opcodeTitle = "0x5A 0x10 • Wheel Speed & Throttle (~4.7 Hz)",
+                    opcodeTitle = "0x5A 0x10 • Speed (B2) + uint24 BE Odometer (B3..5 = ${telemetry.odometerKm?.let { String.format(Locale.US, "%,.1f km", it) } ?: "35,925.2 km"}, 4.7 Hz)",
                     packetCount = telemetry.packetCount0x10,
                     frame = telemetry.latestFrame0x10,
-                    highlightByteIndex = 2,
+                    highlightByteIndex = byteOffsetMapping.odometerStartOffsetIn0x10,
                     accentColor = ElectricCyan
                 )
                 HexFrameInspectorRow(
-                    opcodeTitle = "0x5A 0x13 • Battery SoC & Range (~3.1 Hz)",
+                    opcodeTitle = "0x5A 0x13 • SoC (B2=${telemetry.batteryPercent ?: "--"}%) + uint16 BE Range (B3..4=${telemetry.clusterRangeKm ?: "--"} km) + State Flag (B5=0x${telemetry.stateFlag0x13Byte5?.let { String.format("%02X", it) } ?: "00"})",
                     packetCount = telemetry.packetCount0x13,
                     frame = telemetry.latestFrame0x13,
-                    highlightByteIndex = byteOffsetMapping.rangeByteOffset,
+                    highlightByteIndex = byteOffsetMapping.rangeStartOffsetIn0x13,
                     accentColor = NeonMint
                 )
                 HexFrameInspectorRow(
-                    opcodeTitle = "0x5A 0x7D • Cluster Status & Bitfields (~3.1 Hz)",
-                    packetCount = telemetry.packetCount0x7D,
-                    frame = telemetry.latestFrame0x7D,
-                    highlightByteIndex = byteOffsetMapping.modeFlagByteOffset,
-                    accentColor = AmberWarning
-                )
-                HexFrameInspectorRow(
-                    opcodeTitle = "0x5A 0x11 • Hardware Odometer & Trips (0.5 Hz / 2.02s)",
+                    opcodeTitle = "0x5A 0x11 • Trip A (B2..4=${telemetry.tripAKm ?: "--"} km) + Chg (B5=0x${telemetry.chargingFlag0x11Byte5?.let { String.format("%02X", it) } ?: "00"}) + SoC Mirror (B6=${telemetry.socMirror0x11 ?: "--"}%) + Trip B (B7..9=${telemetry.tripBKm ?: "--"} km)",
                     packetCount = telemetry.packetCount0x11,
                     frame = telemetry.latestFrame0x11,
-                    highlightByteIndex = byteOffsetMapping.odometerByteOffset,
+                    highlightByteIndex = byteOffsetMapping.chargingFlagOffsetIn0x11,
                     accentColor = EnergeticCoral
+                )
+                HexFrameInspectorRow(
+                    opcodeTitle = "0x5A 0x7D • ASCII Vehicle Model & ID String (B2..18 = \"${telemetry.vehicleIdString ?: IqubeBleSpec.CLUSTER_VEHICLE_ID_DEFAULT}\", 3.1 Hz)",
+                    packetCount = telemetry.packetCount0x7D,
+                    frame = telemetry.latestFrame0x7D,
+                    highlightByteIndex = 2,
+                    accentColor = AmberWarning
                 )
             }
 
-            // 2. Interactive Byte-Offset Mapper (Bytes 3..19)
+            // 3. Interactive Byte-Offset & Unfiltered Layout Mapper
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -149,107 +183,38 @@ fun HexInspectorScreen(
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
                 Text(
-                    text = "DYNAMIC BYTE-OFFSET MAPPER (BYTES 3..18)",
+                    text = "UNFILTERED 20-BYTE PACKET OFFSET MAPPER",
                     style = MaterialTheme.typography.labelMedium,
                     color = NeonMint
                 )
-                Text(
-                    text = "Tap a byte index to dynamically remap which offset in incoming 20-byte frames feeds Range, Trip A, Trip B, and Odometer.",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = TextSecondary
+
+                ByteIndexSelectorRow(
+                    label = "0x10 Total Odometer uint24 BE Start Byte (Default Byte 3: 05 7B 54 = 35,925.2 km)",
+                    selectedIndex = byteOffsetMapping.odometerStartOffsetIn0x10,
+                    validIndices = 3..15,
+                    onSelect = { onUpdateMapping(byteOffsetMapping.copy(odometerStartOffsetIn0x10 = it)) }
                 )
 
                 ByteIndexSelectorRow(
-                    label = "0x13 Projected Range (km) Byte Offset (Default Byte 3 = 0x60 / 96 km)",
-                    selectedIndex = byteOffsetMapping.rangeByteOffset,
-                    validIndices = 3..18,
-                    onSelect = { onUpdateMapping(byteOffsetMapping.copy(rangeByteOffset = it)) }
-                )
-
-                ByteIndexSelectorRow(
-                    label = "0x11 Odometer (32-bit LE, 0.1 km) Start Byte Offset (Default Byte 3)",
-                    selectedIndex = byteOffsetMapping.odometerByteOffset,
-                    validIndices = 3..14,
-                    onSelect = { onUpdateMapping(byteOffsetMapping.copy(odometerByteOffset = it)) }
-                )
-
-                ByteIndexSelectorRow(
-                    label = "0x11 Trip A (16-bit LE, 0.1 km) Start Byte Offset (Default Byte 7)",
-                    selectedIndex = byteOffsetMapping.tripAByteOffset,
+                    label = "0x13 Cluster Projected Range uint16 BE Start Byte (Default Byte 3: 01 90 = 40.0 km)",
+                    selectedIndex = byteOffsetMapping.rangeStartOffsetIn0x13,
                     validIndices = 3..16,
-                    onSelect = { onUpdateMapping(byteOffsetMapping.copy(tripAByteOffset = it)) }
+                    onSelect = { onUpdateMapping(byteOffsetMapping.copy(rangeStartOffsetIn0x13 = it)) }
                 )
 
                 ByteIndexSelectorRow(
-                    label = "0x7D Ride Mode & Regen Bitfield Byte Offset (Default Byte 3)",
-                    selectedIndex = byteOffsetMapping.modeFlagByteOffset,
-                    validIndices = 3..18,
-                    onSelect = { onUpdateMapping(byteOffsetMapping.copy(modeFlagByteOffset = it)) }
-                )
-            }
-
-            // 3. 0x5A 0x7D Cluster Bitfield Inspector
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(16.dp))
-                    .background(SlateSurface)
-                    .border(1.dp, SlateBorder, RoundedCornerShape(16.dp))
-                    .padding(16.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Text(
-                    text = "0x5A 0x7D CLUSTER STATUS BITFIELD INSPECTOR",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = AmberWarning
-                )
-                val frame7D = telemetry.latestFrame0x7D
-                val flagByte = if (frame7D != null && byteOffsetMapping.modeFlagByteOffset < frame7D.size) {
-                    frame7D[byteOffsetMapping.modeFlagByteOffset].toInt() and 0xFF
-                } else null
-
-                Text(
-                    text = "Identity Byte 2: ${telemetry.clusterIdentityByte?.let { "0x${Integer.toHexString(it).uppercase()} ($it dec)" } ?: "--"}  •  Flag Byte [${byteOffsetMapping.modeFlagByteOffset}]: ${flagByte?.let { "0b" + it.toString(2).padStart(8, '0') } ?: "--"}",
-                    style = MaterialTheme.typography.labelLarge,
-                    color = TextPrimary
+                    label = "0x11 Hardware Trip A uint24 BE Start Byte (Default Byte 2: 00 00 03 = 0.3 km)",
+                    selectedIndex = byteOffsetMapping.tripAStartOffsetIn0x11,
+                    validIndices = 2..14,
+                    onSelect = { onUpdateMapping(byteOffsetMapping.copy(tripAStartOffsetIn0x11 = it)) }
                 )
 
-                FlowRow(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    val bitLabels = listOf(
-                        "Bit 0: Power Mode",
-                        "Bit 1: Regen Active",
-                        "Bit 2: Cluster Lamp",
-                        "Bit 3: Park Standby",
-                        "Bit 4: Ignition Lock",
-                        "Bit 5: Left Turn",
-                        "Bit 6: Right Turn",
-                        "Bit 7: Hazard Alert"
-                    )
-                    bitLabels.forEachIndexed { bitIdx, name ->
-                        val isHigh = flagByte != null && ((flagByte shr bitIdx) and 1) == 1
-                        Box(
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(8.dp))
-                                .background(if (isHigh) NeonMint.copy(alpha = 0.2f) else SlateCardElevated)
-                                .border(
-                                    1.dp,
-                                    if (isHigh) NeonMint else SlateBorder,
-                                    RoundedCornerShape(8.dp)
-                                )
-                                .padding(horizontal = 10.dp, vertical = 6.dp)
-                        ) {
-                            Text(
-                                text = "$name = ${if (isHigh) "1" else "0"}",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = if (isHigh) NeonMint else TextSecondary
-                            )
-                        }
-                    }
-                }
+                ByteIndexSelectorRow(
+                    label = "0x11 Hardware Trip B uint24 BE Start Byte (Default Byte 7: 00 00 0A = 1.0 km)",
+                    selectedIndex = byteOffsetMapping.tripBStartOffsetIn0x11,
+                    validIndices = 5..15,
+                    onSelect = { onUpdateMapping(byteOffsetMapping.copy(tripBStartOffsetIn0x11 = it)) }
+                )
             }
         }
     }
@@ -279,7 +244,8 @@ private fun HexFrameInspectorRow(
                 text = opcodeTitle,
                 style = MaterialTheme.typography.labelMedium,
                 fontWeight = FontWeight.Bold,
-                color = accentColor
+                color = accentColor,
+                modifier = Modifier.weight(1f)
             )
             Text(
                 text = "$packetCount pkts",
@@ -295,13 +261,14 @@ private fun HexFrameInspectorRow(
                 color = TextSecondary
             )
         } else {
+            val safeIdx = highlightByteIndex.coerceIn(0, frame.size - 1)
             Text(
                 text = "HEX: ${frame.toHexString()}",
                 style = MaterialTheme.typography.labelSmall,
                 color = TextPrimary
             )
             Text(
-                text = "ASCII: ${frame.toAsciiPreview()}   |   Byte[$highlightByteIndex] = 0x${String.format("%02X", frame[highlightByteIndex].toInt() and 0xFF)} (${frame[highlightByteIndex].toInt() and 0xFF})",
+                text = "ASCII: ${frame.toAsciiPreview()}   |   Byte[$safeIdx] = 0x${String.format("%02X", frame[safeIdx].toInt() and 0xFF)}   |   Byte[19] = 0x${String.format("%02X", frame[19].toInt() and 0xFF)}",
                 style = MaterialTheme.typography.labelSmall,
                 color = TextSecondary
             )

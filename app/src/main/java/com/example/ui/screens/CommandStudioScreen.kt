@@ -2,12 +2,8 @@ package com.example.ui.screens
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.ExperimentalLayoutApi
-import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -23,12 +19,10 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Slider
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -38,9 +32,9 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import com.example.model.ClusterAlertType
-import com.example.model.NavigationTurnIcon
+import com.example.model.IqubeBleSpec
 import com.example.model.QueuedWriteCommand
+import com.example.model.TripSubcommandConfig
 import com.example.model.WriteCommandStatus
 import com.example.model.toAsciiPreview
 import com.example.model.toHexString
@@ -53,32 +47,44 @@ import com.example.ui.theme.SlateCardElevated
 import com.example.ui.theme.SlateSurface
 import com.example.ui.theme.TextPrimary
 import com.example.ui.theme.TextSecondary
-import kotlin.math.roundToInt
+import java.nio.charset.StandardCharsets
+import java.util.Locale
 
-@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun CommandStudioScreen(
     commandHistory: List<QueuedWriteCommand>,
     queueDepth: Int,
     heartbeatEnabled: Boolean,
+    autoLocationSyncEnabled: Boolean,
+    detectedLocalityName: String,
+    customLocationOverride: String,
+    lastSyncedClusterLocation: String?,
+    tripSubcommandConfig: TripSubcommandConfig,
     onSetHeartbeatEnabled: (Boolean) -> Unit,
-    onSendNavigation: (NavigationTurnIcon, Int, String, Boolean) -> Unit,
-    onSendCallerAlert: (ClusterAlertType, String) -> Unit,
+    onSetAutoLocationSync: (Boolean) -> Unit,
+    onCustomLocationOverrideChange: (String) -> Unit,
+    onDumpLocationToCluster: (String?) -> Unit,
+    onUpdateTripSubcommandConfig: (TripSubcommandConfig) -> Unit,
+    onSwitchToTripAClick: () -> Unit,
+    onSwitchToTripBClick: () -> Unit,
+    onResetActiveTripClick: () -> Unit,
     onSendCustomHex: (String, String) -> Result<Unit>,
     modifier: Modifier = Modifier
 ) {
     val scrollState = rememberScrollState()
 
-    var selectedTurn by remember { mutableStateOf(NavigationTurnIcon.TURN_RIGHT) }
-    var navDistanceMeters by remember { mutableFloatStateOf(250f) }
-    var navRoadName by remember { mutableStateOf("100 FT INDIRANAGAR") }
-    var use5ANavEnvelope by remember { mutableStateOf(false) }
-
-    var selectedAlertType by remember { mutableStateOf(ClusterAlertType.INCOMING_CALL) }
-    var callerBannerText by remember { mutableStateOf("PRIYA SHARMA") }
+    var tripAHex by remember(tripSubcommandConfig.switchTripAByte) {
+        mutableStateOf(String.format(Locale.US, "%02X", tripSubcommandConfig.switchTripAByte))
+    }
+    var tripBHex by remember(tripSubcommandConfig.switchTripBByte) {
+        mutableStateOf(String.format(Locale.US, "%02X", tripSubcommandConfig.switchTripBByte))
+    }
+    var resetHex by remember(tripSubcommandConfig.resetActiveTripByte) {
+        mutableStateOf(String.format(Locale.US, "%02X", tripSubcommandConfig.resetActiveTripByte))
+    }
 
     var customHexInput by remember {
-        mutableStateOf("5A F1 00 01 01 00 00 00 00 00 00 00 00 00 00 00 00 00 A8 FF")
+        mutableStateOf("5A F1 00 03 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 FF")
     }
     var customHexError by remember { mutableStateOf<String?>(null) }
 
@@ -95,7 +101,7 @@ fun CommandStudioScreen(
                 .widthIn(max = 680.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
-            // 1. Turn-by-Turn Navigation Feeder (5B 5C 57 / [\W or 5A 57 .. FF)
+            // 1. Live Cluster Location Display Synchronizer (`0x5B 0x5C` + 17B ASCII String + `0xFF`)
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -110,97 +116,98 @@ fun CommandStudioScreen(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text(
-                        text = "TURN-BY-TURN NAVIGATION FEEDER (0x5352 / 0x0022)",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = ElectricCyan
-                    )
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "LIVE CLUSTER LOCATION DISPLAY (0x5B 0x5C + 17B ASCII + 0xFF)",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = ElectricCyan
+                        )
+                        Text(
+                            text = "Unfiltered Frame Rule: Byte 0=0x5B ('['), Byte 1=0x5C ('\\'), Bytes 2..18 = 17-char ASCII locality padded with 0x00, Byte 19=0xFF.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = TextSecondary
+                        )
+                    }
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text(
-                            text = if (use5ANavEnvelope) "5A..FF Frame" else "[\\W (5B 5C 57)",
+                            text = "Auto 10s",
                             style = MaterialTheme.typography.labelSmall,
                             color = TextSecondary
                         )
                         Spacer(modifier = Modifier.width(6.dp))
                         Switch(
-                            checked = use5ANavEnvelope,
-                            onCheckedChange = { use5ANavEnvelope = it }
+                            checked = autoLocationSyncEnabled,
+                            onCheckedChange = onSetAutoLocationSync
                         )
                     }
                 }
 
-                FlowRow(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    NavigationTurnIcon.entries.forEach { icon ->
-                        val isSelected = selectedTurn == icon
-                        Box(
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(10.dp))
-                                .background(if (isSelected) ElectricCyan.copy(alpha = 0.2f) else SlateCardElevated)
-                                .border(
-                                    1.dp,
-                                    if (isSelected) ElectricCyan else SlateBorder,
-                                    RoundedCornerShape(10.dp)
-                                )
-                                .clickable { selectedTurn = icon }
-                                .padding(horizontal = 10.dp, vertical = 6.dp)
-                        ) {
-                            Text(
-                                text = "${icon.symbol} ${icon.label}",
-                                style = MaterialTheme.typography.labelMedium,
-                                color = if (isSelected) ElectricCyan else TextPrimary
-                            )
-                        }
-                    }
+                val activeText = customLocationOverride.ifBlank { detectedLocalityName }
+                    .take(IqubeBleSpec.MAX_LOCATION_ASCII_BYTES)
+                val previewBytes = remember(activeText) {
+                    val pkt = ByteArray(20)
+                    pkt[0] = 0x5B
+                    pkt[1] = 0x5C
+                    val ascii = activeText.replace(Regex("[^\\x20-\\x7E]"), "")
+                        .trim()
+                        .take(IqubeBleSpec.MAX_LOCATION_ASCII_BYTES)
+                        .toByteArray(StandardCharsets.US_ASCII)
+                    System.arraycopy(ascii, 0, pkt, 2, minOf(ascii.size, IqubeBleSpec.MAX_LOCATION_ASCII_BYTES))
+                    pkt[19] = 0xFF.toByte()
+                    pkt
                 }
 
-                Text(
-                    text = "Distance to Turn: ${navDistanceMeters.roundToInt()} meters",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = TextSecondary
-                )
-                Slider(
-                    value = navDistanceMeters,
-                    onValueChange = { navDistanceMeters = it },
-                    valueRange = 10f..2000f
-                )
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(SlateCardElevated)
+                        .padding(10.dp)
+                ) {
+                    Text(
+                        text = "Nominatim Reverse-Geocoded Locality: \"$detectedLocalityName\"  |  Last Sent: \"${lastSyncedClusterLocation ?: "--"}\"",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = NeonMint
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = "20B Packet Hex (Byte 19=0xFF): ${previewBytes.toHexString()}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = ElectricCyan
+                    )
+                    Text(
+                        text = "ASCII Preview: ${previewBytes.toAsciiPreview()}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = TextPrimary
+                    )
+                }
 
                 OutlinedTextField(
-                    value = navRoadName,
-                    onValueChange = { navRoadName = it.take(15) },
-                    label = { Text("Cluster Road Name (ASCII max 13–14 chars)") },
+                    value = customLocationOverride,
+                    onValueChange = { onCustomLocationOverrideChange(it.take(IqubeBleSpec.MAX_LOCATION_ASCII_BYTES)) },
+                    label = { Text("Custom 17-Character Location Text Override (Bytes 2..18, Byte 19=0xFF)") },
                     singleLine = true,
                     modifier = Modifier
                         .fillMaxWidth()
-                        .testTag("nav_road_name_input")
+                        .testTag("studio_location_override_input")
                 )
 
                 Button(
-                    onClick = {
-                        onSendNavigation(
-                            selectedTurn,
-                            navDistanceMeters.roundToInt(),
-                            navRoadName,
-                            use5ANavEnvelope
-                        )
-                    },
+                    onClick = { onDumpLocationToCluster(null) },
                     colors = ButtonDefaults.buttonColors(containerColor = ElectricCyan, contentColor = SlateSurface),
                     modifier = Modifier
                         .fillMaxWidth()
-                        .testTag("dispatch_nav_frame_button")
+                        .testTag("studio_dump_location_button")
                 ) {
                     Text(
-                        text = "Dispatch 20-Byte Navigation Frame to 0x5352",
+                        text = "Dump Current Location to Cluster (\"$activeText\" + 0xFF)",
                         style = MaterialTheme.typography.labelLarge,
                         fontWeight = FontWeight.Bold
                     )
                 }
             }
 
-            // 2. Caller ID / SMS / Cluster Alert Banner (5B 5D 43 / []C)
+            // 2. Verified Trip Control Buttons & Subcommand Byte Configurator (5A F1 00 <subCmd> ... FF)
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -211,65 +218,87 @@ fun CommandStudioScreen(
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 Text(
-                    text = "CALLER ID & CLUSTER ALERT BANNER (5B 5D 43 / []C)",
+                    text = "VERIFIED TRIP CONTROL PAYLOADS (0x5352 / HANDLE 0x0022 • 0x5A 0xF1 0x00 … 0xFF)",
                     style = MaterialTheme.typography.labelMedium,
                     color = NeonMint
                 )
-
-                FlowRow(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    ClusterAlertType.entries.forEach { alert ->
-                        val selected = selectedAlertType == alert
-                        Box(
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(10.dp))
-                                .background(if (selected) NeonMint.copy(alpha = 0.2f) else SlateCardElevated)
-                                .border(
-                                    1.dp,
-                                    if (selected) NeonMint else SlateBorder,
-                                    RoundedCornerShape(10.dp)
-                                )
-                                .clickable { selectedAlertType = alert }
-                                .padding(horizontal = 10.dp, vertical = 6.dp)
-                        ) {
-                            Text(
-                                text = alert.label,
-                                style = MaterialTheme.typography.labelMedium,
-                                color = if (selected) NeonMint else TextPrimary
-                            )
-                        }
-                    }
-                }
-
-                OutlinedTextField(
-                    value = callerBannerText,
-                    onValueChange = { callerBannerText = it.take(15) },
-                    label = { Text("Caller / Alert ASCII Banner (15 bytes max)") },
-                    singleLine = true,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .testTag("caller_banner_input")
+                Text(
+                    text = "Hardware verified: Switch to Trip A (0x03), Switch to Trip B (0x01), Reset Active Trip A/B (0x02). Every packet ends with Byte 19 = 0xFF.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = TextSecondary
                 )
 
-                Button(
-                    onClick = { onSendCallerAlert(selectedAlertType, callerBannerText) },
-                    colors = ButtonDefaults.buttonColors(containerColor = NeonMint, contentColor = SlateSurface),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .testTag("dispatch_alert_frame_button")
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    Text(
-                        text = "Push Alert Banner Frame (5B 5D 43 … FF)",
-                        style = MaterialTheme.typography.labelLarge,
-                        fontWeight = FontWeight.Bold
+                    OutlinedTextField(
+                        value = tripAHex,
+                        onValueChange = { v ->
+                            tripAHex = v.take(2)
+                            v.toIntOrNull(16)?.let {
+                                onUpdateTripSubcommandConfig(tripSubcommandConfig.copy(switchTripAByte = it and 0xFF))
+                            }
+                        },
+                        label = { Text("Trip A Byte (Hex)") },
+                        singleLine = true,
+                        modifier = Modifier.weight(1f)
                     )
+                    OutlinedTextField(
+                        value = tripBHex,
+                        onValueChange = { v ->
+                            tripBHex = v.take(2)
+                            v.toIntOrNull(16)?.let {
+                                onUpdateTripSubcommandConfig(tripSubcommandConfig.copy(switchTripBByte = it and 0xFF))
+                            }
+                        },
+                        label = { Text("Trip B Byte (Hex)") },
+                        singleLine = true,
+                        modifier = Modifier.weight(1f)
+                    )
+                    OutlinedTextField(
+                        value = resetHex,
+                        onValueChange = { v ->
+                            resetHex = v.take(2)
+                            v.toIntOrNull(16)?.let {
+                                onUpdateTripSubcommandConfig(tripSubcommandConfig.copy(resetActiveTripByte = it and 0xFF))
+                            }
+                        },
+                        label = { Text("Reset A/B (Hex)") },
+                        singleLine = true,
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Button(
+                        onClick = onSwitchToTripAClick,
+                        colors = ButtonDefaults.buttonColors(containerColor = NeonMint, contentColor = SlateSurface),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("Switch to Trip A", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
+                    }
+                    Button(
+                        onClick = onSwitchToTripBClick,
+                        colors = ButtonDefaults.buttonColors(containerColor = ElectricCyan, contentColor = SlateSurface),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("Switch to Trip B", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
+                    }
+                    Button(
+                        onClick = onResetActiveTripClick,
+                        colors = ButtonDefaults.buttonColors(containerColor = EnergeticCoral, contentColor = SlateSurface),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("Reset Active (A/B)", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
+                    }
                 }
             }
 
-            // 3. Guarded 20-Byte Hex Command Builder & Protocol Validator
+            // 3. Guarded 20-Byte Hex Command Builder & Protocol Validator (Byte 19 = 0xFF)
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -280,12 +309,12 @@ fun CommandStudioScreen(
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 Text(
-                    text = "GUARDED 20-BYTE HEX INJECTOR (PROTOCOL SAFETY CHECK)",
+                    text = "GUARDED 20-BYTE HEX INJECTOR (MANDATORY BYTE 19 = 0xFF)",
                     style = MaterialTheme.typography.labelMedium,
                     color = AmberWarning
                 )
                 Text(
-                    text = "Enforces 20-byte length and valid 0x5A…0xFF or 0x5B ([RU, [JD, [\\W, []C) framing before GATT write.",
+                    text = "Enforces 20-byte length, valid 0x5A or 0x5B ([RU, [JD, [\\, []C) prefix, and mandatory Byte 19 = 0xFF trailer before GATT write on 0x5352.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = TextSecondary
                 )
@@ -296,7 +325,7 @@ fun CommandStudioScreen(
                         customHexInput = it
                         customHexError = null
                     },
-                    label = { Text("20-Byte Hex Payload (Space-separated)") },
+                    label = { Text("20-Byte Hex Payload (Space-separated, Byte 19 = FF)") },
                     modifier = Modifier
                         .fillMaxWidth()
                         .testTag("custom_hex_input")
@@ -321,7 +350,7 @@ fun CommandStudioScreen(
                         .testTag("send_custom_hex_button")
                 ) {
                     Text(
-                        text = "Validate & Enqueue 20-Byte Frame",
+                        text = "Validate & Enqueue 20-Byte Frame (0x5352)",
                         style = MaterialTheme.typography.labelLarge,
                         fontWeight = FontWeight.Bold
                     )
@@ -345,7 +374,7 @@ fun CommandStudioScreen(
                 ) {
                     Column {
                         Text(
-                            text = "SERIALIZED FIFO WRITE QUEUE (HANDLE 0x0022)",
+                            text = "SERIALIZED FIFO WRITE QUEUE (0x5352 / HANDLE 0x0022)",
                             style = MaterialTheme.typography.labelMedium,
                             color = ElectricCyan
                         )
@@ -357,7 +386,7 @@ fun CommandStudioScreen(
                     }
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text(
-                            text = "[JD 1.8s Sync",
+                            text = "[JD 1.8s Clock",
                             style = MaterialTheme.typography.labelSmall,
                             color = TextSecondary
                         )
@@ -371,7 +400,7 @@ fun CommandStudioScreen(
 
                 if (commandHistory.isEmpty()) {
                     Text(
-                        text = "No outgoing commands dispatched yet. Trigger an action above or start HCI Replay.",
+                        text = "No outgoing commands dispatched yet. Trigger an action above or start Ride / Charge Replay.",
                         style = MaterialTheme.typography.bodyMedium,
                         color = TextSecondary
                     )

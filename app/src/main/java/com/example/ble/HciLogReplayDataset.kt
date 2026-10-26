@@ -1,23 +1,33 @@
 package com.example.ble
 
 import com.example.model.IqubeBleSpec
-import kotlin.math.roundToInt
+import java.nio.charset.StandardCharsets
+
+data class ChargingCaptureStep(
+    val socPercent: Int,
+    val clusterRangeTenthsKm: Int,
+    val measuredStepDurationSec: Double?
+)
 
 /**
- * Reconstructs the real binary telemetry stream captured from `btsnooz_hci.log`
- * (Target MAC `F8:55:48:72:96:DA`, TI BLE 4.2 Controller `0x000D`, Negotiated MTU `247`):
- * - 5 real throttle bursts: `11 km/h`, `20 km/h`, `10 km/h`, `52 km/h`, `14 km/h`
- * - `0x5A 0x13 0x5B`: Battery SoC `91%` (`0x5B`), Projected Eco Range `96 km` (`0x60`), Pack Voltage `51.2V` (`0x0200`)
- * - `0x5A 0x7D 0x54`: Cluster status (`Byte 2 = 0x54` / `84` decimal), Eco/Power mode & Regen flags
- * - `0x5A 0x11 0x00`: Odometer `1,750.4 km` (`17504` = `0x00004460`), Trip A `18.4 km` (`184` = `0x00B8`), Trip B `6.2 km` (`62` = `0x003E`)
- *
- * All generated frames are fed as raw byte arrays into `IqubePacketParser.ingestRawChunk(...)`
- * (including optional ATT slice fragmentation) so the parser, sprint timer, and UI operate on real binary frames.
+ * Reconstructs the verified unfiltered 20-byte binary frames (with `Byte 19 = 0xFF`) from:
+ * 1. Riding Capture (`btsnooz_hci.log`):
+ *    - `0x5A 0x10`: 5 throttle bursts (`11`, `20`, `10`, `52`, `14 km/h`), Total Odometer `05 7B 54` = `35,925.2 km`
+ *    - `0x5A 0x13`: Battery SoC `91%` (`0x5B`), Cluster Range `03 C0` = `96.0 km`, `Byte 5 = 0x00`
+ *    - `0x5A 0x11`: Trip A `0.3 km` (`00 00 03`), `Byte 5 = 0x00`, `Byte 6 = 91`, Trip B `1.0 km` (`00 00 0A`)
+ *    - `0x5A 0x7D`: ASCII `"TVSiQUBEJI573"` in `Bytes 2..18`
+ * 2. Unfiltered Charging Capture (`btsnoop_hci.log`, `4,865` packets):
+ *    - `0x5A 0x10`: Wheel speed `0 km/h`, Total Odometer `05 7B 54` = `35,925.2 km`
+ *    - `0x5A 0x13`: Battery SoC `38%..42%` (`0x26..0x2A`), Cluster Range `40.0 km..45.0 km` (`0x0190..0x01C2`), `Byte 5 = 0x06` (Charging Mode)
+ *    - `0x5A 0x11`: Trip A `0.3 km` (`00 00 03`), `Byte 5 = 0x01` (Charging Active), `Byte 6 = SoC%`, Trip B `1.0 km` (`00 00 0A`)
+ *    - `0x5A 0x7D`: ASCII `"TVSiQUBEJI573"` in `Bytes 2..18`
  */
 object HciLogReplayDataset {
 
-    // Speed profile (km/h) sampled at ~4.7 Hz (212 ms steps) reproducing the 5 throttle bursts
-    // and integrating to ~146.2 meters (0.1 km cluster step) over a full pass.
+    const val CHARGING_CAPTURE_ODO_TENTHS_KM = 359252    // 0x057B54 = 35,925.2 km
+    const val CHARGING_CAPTURE_TRIP_A_TENTHS_KM = 3      // 0x000003 = 0.3 km
+    const val CHARGING_CAPTURE_TRIP_B_TENTHS_KM = 10     // 0x00000A = 1.0 km
+
     val CAPTURED_SPEED_PROFILE_KMH: IntArray = intArrayOf(
         // Burst 1: Peak 11 km/h
         0, 0, 3, 6, 9, 11, 11, 10, 7, 4, 1, 0,
@@ -31,85 +41,102 @@ object HciLogReplayDataset {
         0, 4, 9, 12, 14, 14, 11, 7, 3, 0
     )
 
-    fun buildSpeedFrame0x10(speedKmh: Int, prevSpeedKmh: Int): ByteArray {
+    // Verified Charging SoC % steps from btsnoop_hci.log: 38% (40.0 km) -> 42% (45.0 km) at ~115.7s per +1%
+    val CHARGING_CAPTURE_STEPS: List<ChargingCaptureStep> = listOf(
+        ChargingCaptureStep(socPercent = 38, clusterRangeTenthsKm = 400, measuredStepDurationSec = null),
+        ChargingCaptureStep(socPercent = 39, clusterRangeTenthsKm = 412, measuredStepDurationSec = 115.7),
+        ChargingCaptureStep(socPercent = 40, clusterRangeTenthsKm = 425, measuredStepDurationSec = 114.8),
+        ChargingCaptureStep(socPercent = 41, clusterRangeTenthsKm = 438, measuredStepDurationSec = 116.5),
+        ChargingCaptureStep(socPercent = 42, clusterRangeTenthsKm = 450, measuredStepDurationSec = 115.8)
+    )
+
+    /**
+     * `0x5A 0x10` (Speed + Total Hardware Odometer, 20 bytes ending in `0xFF`):
+     * - `Byte 2` = `speedKmh`
+     * - `Bytes 3..5` = `uint24 Big-Endian` Total Odometer in `0.1 km` (`359,252` = `0x057B54` = `35,925.2 km`)
+     */
+    fun buildSpeedOdometerFrame0x10(
+        speedKmh: Int,
+        totalOdometerTenthsKm: Int = CHARGING_CAPTURE_ODO_TENTHS_KM
+    ): ByteArray {
         val frame = ByteArray(IqubeBleSpec.STANDARD_FRAME_SIZE)
         frame[0] = IqubeBleSpec.HEADER_TELEMETRY // 0x5A
-        frame[1] = IqubeBleSpec.OPCODE_SPEED_THROTTLE // 0x10
+        frame[1] = IqubeBleSpec.OPCODE_SPEED_ODOMETER // 0x10
         frame[2] = (speedKmh and 0xFF).toByte()
-        val throttlePct = if (speedKmh > prevSpeedKmh) {
-            minOf(100, speedKmh * 2 + 15)
-        } else if (speedKmh > 0) {
-            minOf(85, (speedKmh * 1.4).roundToInt())
-        } else 0
-        frame[3] = (throttlePct and 0xFF).toByte()
-
-        // Instant motor power in Watts (16-bit LE at Bytes 4..5)
-        val powerWatts = if (speedKmh > 0) (speedKmh * 68 + throttlePct * 12) else 0
-        frame[4] = (powerWatts and 0xFF).toByte()
-        frame[5] = ((powerWatts shr 8) and 0xFF).toByte()
-        frame[19] = IqubeBleSpec.FOOTER_DELIMITER
+        frame[3] = ((totalOdometerTenthsKm shr 16) and 0xFF).toByte()
+        frame[4] = ((totalOdometerTenthsKm shr 8) and 0xFF).toByte()
+        frame[5] = (totalOdometerTenthsKm and 0xFF).toByte()
+        frame[19] = IqubeBleSpec.FOOTER_DELIMITER // 0xFF
         return frame
     }
 
-    fun buildBatteryFrame0x13(
-        socPercent: Int = 91, // 0x5B from btsnooz_hci.log
-        rangeEcoKm: Int = 96, // 0x60 from btsnooz_hci.log
-        packDecivolts: Int = 512, // 51.2V
-        isCharging: Boolean = false
+    /**
+     * `0x5A 0x13` (Battery SoC + Cluster Range + Charging Mode, 20 bytes ending in `0xFF`):
+     * - `Byte 2` = `socPercent` (`0x26..0x2A` = `38%..42%`, or `0x5B` = `91%`)
+     * - `Bytes 3..4` = `uint16 Big-Endian` Cluster Range in `0.1 km` (`0x0190` = `40.0 km` .. `0x01C2` = `45.0 km`)
+     * - `Byte 5` = `0x06` when charging, `0x00` when riding
+     */
+    fun buildBatteryRangeFrame0x13(
+        socPercent: Int = 38,
+        clusterRangeTenthsKm: Int = 400, // 0x0190 = 40.0 km
+        isCharging: Boolean = true
     ): ByteArray {
         val frame = ByteArray(IqubeBleSpec.STANDARD_FRAME_SIZE)
         frame[0] = IqubeBleSpec.HEADER_TELEMETRY // 0x5A
         frame[1] = IqubeBleSpec.OPCODE_BATTERY_RANGE // 0x13
-        frame[2] = (socPercent and 0xFF).toByte() // 0x5B = 91%
-        frame[3] = (rangeEcoKm and 0xFF).toByte() // 0x60 = 96 km
-        frame[4] = (packDecivolts and 0xFF).toByte()
-        frame[5] = ((packDecivolts shr 8) and 0xFF).toByte()
-        frame[6] = if (isCharging) 0x01 else 0x00
-        frame[7] = 0x20 // Battery temp 32°C
-        frame[19] = IqubeBleSpec.FOOTER_DELIMITER
+        frame[2] = (socPercent and 0xFF).toByte()
+        frame[3] = ((clusterRangeTenthsKm shr 8) and 0xFF).toByte()
+        frame[4] = (clusterRangeTenthsKm and 0xFF).toByte()
+        frame[5] = if (isCharging) IqubeBleSpec.FLAG_0X13_CHARGING_MODE else 0x00
+        frame[19] = IqubeBleSpec.FOOTER_DELIMITER // 0xFF
         return frame
     }
 
-    fun buildClusterStatusFrame0x7D(
-        speedKmh: Int,
-        isRegen: Boolean,
-        isLampOn: Boolean
+    /**
+     * `0x5A 0x11` (Hardware Trip A, Trip B, & Charging Active Flag, 20 bytes ending in `0xFF`):
+     * - `Bytes 2..4` = `uint24 Big-Endian` Trip A in `0.1 km` (`00 00 03` = `0.3 km`)
+     * - `Byte 5` = `0x01` when Charging Active, `0x00` when Not Charging
+     * - `Byte 6` = `socMirrorPercent` (`d[6]`)
+     * - `Bytes 7..9` = `uint24 Big-Endian` Trip B in `0.1 km` (`00 00 0A` = `1.0 km`)
+     */
+    fun buildTripsAndChargingFrame0x11(
+        tripATenthsKm: Int = CHARGING_CAPTURE_TRIP_A_TENTHS_KM,   // 00 00 03 = 0.3 km
+        tripBTenthsKm: Int = CHARGING_CAPTURE_TRIP_B_TENTHS_KM,   // 00 00 0A = 1.0 km
+        isChargingActive: Boolean = true,
+        socMirrorPercent: Int = 38
     ): ByteArray {
         val frame = ByteArray(IqubeBleSpec.STANDARD_FRAME_SIZE)
         frame[0] = IqubeBleSpec.HEADER_TELEMETRY // 0x5A
-        frame[1] = IqubeBleSpec.OPCODE_CLUSTER_STATUS // 0x7D
-        frame[2] = 0x54 // 84 decimal verified from btsnooz_hci.log
-        var flags = 0
-        if (speedKmh >= 35) flags = flags or 0x01 // Power mode when >35 km/h
-        if (isRegen) flags = flags or 0x02        // Regenerative braking active
-        if (isLampOn) flags = flags or 0x04       // Dashboard lamp on
-        frame[3] = flags.toByte()
-        frame[4] = 0x01 // Ignition unlocked
-        frame[19] = IqubeBleSpec.FOOTER_DELIMITER
-        return frame
-    }
-
-    fun buildOdometerFrame0x11(
-        odometerTenthsKm: Int = 17504, // 1,750.4 km
-        tripATenthsKm: Int = 184,      // 18.4 km
-        tripBTenthsKm: Int = 62        // 6.2 km
-    ): ByteArray {
-        val frame = ByteArray(IqubeBleSpec.STANDARD_FRAME_SIZE)
-        frame[0] = IqubeBleSpec.HEADER_TELEMETRY // 0x5A
-        frame[1] = IqubeBleSpec.OPCODE_ODOMETER_TRIPS // 0x11
-        frame[2] = 0x00
-        // Odometer 32-bit LE at Bytes 3..6
-        frame[3] = (odometerTenthsKm and 0xFF).toByte()
-        frame[4] = ((odometerTenthsKm shr 8) and 0xFF).toByte()
-        frame[5] = ((odometerTenthsKm shr 16) and 0xFF).toByte()
-        frame[6] = ((odometerTenthsKm shr 24) and 0xFF).toByte()
-        // Trip A 16-bit LE at Bytes 7..8
-        frame[7] = (tripATenthsKm and 0xFF).toByte()
-        frame[8] = ((tripATenthsKm shr 8) and 0xFF).toByte()
-        // Trip B 16-bit LE at Bytes 9..10
+        frame[1] = IqubeBleSpec.OPCODE_TRIPS_CHARGING // 0x11
+        // Bytes 2..4: Trip A uint24 BE
+        frame[2] = ((tripATenthsKm shr 16) and 0xFF).toByte()
+        frame[3] = ((tripATenthsKm shr 8) and 0xFF).toByte()
+        frame[4] = (tripATenthsKm and 0xFF).toByte()
+        // Byte 5: Charging Active Flag (0x01 = Charging Active)
+        frame[5] = if (isChargingActive) IqubeBleSpec.FLAG_0X11_CHARGING_ACTIVE else 0x00
+        // Byte 6: Battery SoC % mirror
+        frame[6] = (socMirrorPercent and 0xFF).toByte()
+        // Bytes 7..9: Trip B uint24 BE
+        frame[7] = ((tripBTenthsKm shr 16) and 0xFF).toByte()
+        frame[8] = ((tripBTenthsKm shr 8) and 0xFF).toByte()
         frame[9] = (tripBTenthsKm and 0xFF).toByte()
-        frame[10] = ((tripBTenthsKm shr 8) and 0xFF).toByte()
-        frame[19] = IqubeBleSpec.FOOTER_DELIMITER
+        frame[19] = IqubeBleSpec.FOOTER_DELIMITER // 0xFF
+        return frame
+    }
+
+    /**
+     * `0x5A 0x7D` (Vehicle Model & ID String, 20 bytes ending in `0xFF`):
+     * - `Bytes 2..18` = ASCII `"TVSiQUBEJI573"`
+     */
+    fun buildVehicleIdentityFrame0x7D(
+        vehicleId: String = IqubeBleSpec.DEFAULT_VEHICLE_ID
+    ): ByteArray {
+        val frame = ByteArray(IqubeBleSpec.STANDARD_FRAME_SIZE)
+        frame[0] = IqubeBleSpec.HEADER_TELEMETRY // 0x5A
+        frame[1] = IqubeBleSpec.OPCODE_VEHICLE_ID // 0x7D
+        val asciiBytes = vehicleId.take(17).toByteArray(StandardCharsets.US_ASCII)
+        System.arraycopy(asciiBytes, 0, frame, 2, asciiBytes.size)
+        frame[19] = IqubeBleSpec.FOOTER_DELIMITER // 0xFF
         return frame
     }
 }

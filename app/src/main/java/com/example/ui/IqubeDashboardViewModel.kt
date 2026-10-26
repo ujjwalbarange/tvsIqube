@@ -3,22 +3,29 @@ package com.example.ui
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import com.example.ble.IqubeBleManager
+import com.example.model.ActiveTripSession
 import com.example.model.BleConnectionPhase
 import com.example.model.ByteOffsetMapping
-import com.example.model.ClusterAlertType
+import com.example.model.ChargingMonitorState
 import com.example.model.GpsBleFusionSample
+import com.example.model.IncomingCallRelayState
 import com.example.model.LastParkedLocation
-import com.example.model.NavigationTurnIcon
+import com.example.model.LastSeenScooterState
 import com.example.model.QueuedWriteCommand
+import com.example.model.RideMode
+import com.example.model.SavedTripRecord
 import com.example.model.TelemetryState
+import com.example.model.TripSubcommandConfig
+import com.example.model.TrueRangeCalculation
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
 enum class DashboardDestination(val route: String, val title: String) {
     COCKPIT("cockpit", "Cockpit"),
-    COMMAND_STUDIO("command_studio", "Cluster Studio"),
-    GPS_LOGGER("gps_logger", "Ride & Park"),
+    SAVED_TRIPS("saved_trips", "Saved Trips"),
+    COMMAND_STUDIO("command_studio", "Cluster Sync"),
+    GPS_LOGGER("gps_logger", "GPS & Park"),
     HEX_INSPECTOR("hex_inspector", "Hex Inspector")
 }
 
@@ -39,10 +46,26 @@ class IqubeDashboardViewModel(application: Application) : AndroidViewModel(appli
     val linkWarningMessage: StateFlow<String?> = bleManager.linkWarningMessage
     val autoReconnectEnabled: StateFlow<Boolean> = bleManager.autoReconnectEnabled
     val heartbeatEnabled: StateFlow<Boolean> = bleManager.heartbeatEnabled
+    val autoLocationSyncEnabled: StateFlow<Boolean> = bleManager.autoLocationSyncEnabled
     val fragmentedSliceTestEnabled: StateFlow<Boolean> = bleManager.fragmentedSliceTestEnabled
 
     val telemetryState: StateFlow<TelemetryState> = bleManager.packetParser.telemetryState
     val byteOffsetMapping: StateFlow<ByteOffsetMapping> = bleManager.packetParser.byteOffsetMapping
+    val tripSubcommandConfig: StateFlow<TripSubcommandConfig> = bleManager.tripSubcommandConfig
+
+    // True Range, Charging Monitor, Last Seen State & Trip History StateFlows
+    val trueRangeState: StateFlow<TrueRangeCalculation> = bleManager.trueRangeState
+    val chargingMonitorState: StateFlow<ChargingMonitorState> = bleManager.chargingMonitorState
+    val lastSeenState: StateFlow<LastSeenScooterState?> = bleManager.lastSeenState
+    val incomingCallState: StateFlow<IncomingCallRelayState> = bleManager.incomingCallState
+    val selectedRangeMode: StateFlow<RideMode> = bleManager.selectedRangeMode
+    val savedTrips: StateFlow<List<SavedTripRecord>> = bleManager.tripRepository.savedTrips
+    val activeTripSession: StateFlow<ActiveTripSession?> = bleManager.activeTripSession
+
+    // Cluster Location Display (`0x5B 0x5C` + 17-byte ASCII locality + `0xFF`)
+    val detectedLocalityName: StateFlow<String> = bleManager.detectedLocalityName
+    val customLocationOverride: StateFlow<String> = bleManager.customLocationOverride
+    val lastSyncedClusterLocation: StateFlow<String?> = bleManager.lastSyncedClusterLocation
 
     val commandHistory: StateFlow<List<QueuedWriteCommand>> = bleManager.commandDispatcher.commandHistory
     val queueDepth: StateFlow<Int> = bleManager.commandDispatcher.queueDepth
@@ -59,8 +82,12 @@ class IqubeDashboardViewModel(application: Application) : AndroidViewModel(appli
         bleManager.startBleScanAndConnect()
     }
 
-    fun startHciLogReplay() {
+    fun startRidingLogReplay() {
         bleManager.startBtsnoozHciLogReplay()
+    }
+
+    fun startChargingLogReplay() {
+        bleManager.startChargingCaptureReplay()
     }
 
     fun disconnectBle() {
@@ -71,29 +98,73 @@ class IqubeDashboardViewModel(application: Application) : AndroidViewModel(appli
         bleManager.packetParser.setActiveTripTab(tabIndex)
     }
 
-    fun sendCycleTripCommand() {
-        bleManager.sendCycleTripCommand()
+    // Verified 3 Trip Control Commands (5A F1 00 <subCmd> ... FF)
+    fun sendSwitchToTripACommand() {
+        bleManager.sendSwitchToTripACommand()
     }
 
-    fun sendResetTripCommand() {
-        bleManager.sendResetTripCommand()
+    fun sendSwitchToTripBCommand() {
+        bleManager.sendSwitchToTripBCommand()
     }
 
-    fun sendToggleDashboardLampCommand() {
-        bleManager.sendToggleDashboardLampCommand()
+    fun sendResetActiveTripCommand() {
+        bleManager.sendResetActiveTripCommand()
     }
 
-    fun sendNavigationInstruction(
-        turnIcon: NavigationTurnIcon,
-        distanceMeters: Int,
-        roadName: String,
-        use5AEnvelope: Boolean = false
-    ) {
-        bleManager.sendNavigationInstruction(turnIcon, distanceMeters, roadName, use5AEnvelope)
+    fun updateTripSubcommandConfig(config: TripSubcommandConfig) {
+        bleManager.updateTripSubcommandConfig(config)
     }
 
-    fun sendCallerOrAlertBanner(alertType: ClusterAlertType, callerText: String) {
-        bleManager.sendCallerOrAlertBanner(alertType, callerText)
+    // Cluster Location Display (`0x5B 0x5C` + 17-byte ASCII Location Name + `0xFF`)
+    fun dumpLocationToClusterNow(customText: String? = null) {
+        bleManager.dumpLocationToClusterNow(customText)
+    }
+
+    fun setCustomLocationOverride(customText: String) {
+        bleManager.setCustomLocationOverride(customText)
+    }
+
+    fun setAutoLocationSyncEnabled(enabled: Boolean) {
+        bleManager.setAutoLocationSyncEnabled(enabled)
+    }
+
+    // Incoming Call Relay (`1st Name + Call Symbol` on `0x5B 0x5C ... 0xFF`)
+    fun triggerIncomingCallAlert(fullCallerName: String) {
+        bleManager.triggerIncomingCallAlert(fullCallerName)
+    }
+
+    fun endIncomingCallAlert() {
+        bleManager.endIncomingCallAlert()
+    }
+
+    // Charging Predictor Actions
+    fun simulateLiveOnePercentChargingStep() {
+        bleManager.simulateLiveOnePercentChargingStep()
+    }
+
+    fun setSelectedRangeMode(mode: RideMode) {
+        bleManager.setSelectedRangeMode(mode)
+    }
+
+    // Saved Trips History & Export Actions
+    fun logSampleVerifiedTrip() {
+        bleManager.tripRepository.logSampleVerifiedTrip()
+    }
+
+    fun deleteSavedTrip(tripId: String) {
+        bleManager.tripRepository.deleteTrip(tripId)
+    }
+
+    fun clearAllSavedTrips() {
+        bleManager.tripRepository.clearAllTrips()
+    }
+
+    fun exportSavedTripsCsv(): String {
+        return bleManager.tripRepository.exportTripsToCsv()
+    }
+
+    fun exportSavedTripsJson(): String {
+        return bleManager.tripRepository.exportTripsToJson()
     }
 
     fun sendCustomHexFrame(label: String, hexString: String): Result<Unit> {

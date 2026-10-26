@@ -1,8 +1,6 @@
 package com.example.ble
 
-import com.example.model.ClusterAlertType
 import com.example.model.IqubeBleSpec
-import com.example.model.NavigationTurnIcon
 import com.example.model.QueuedWriteCommand
 import com.example.model.WriteCommandStatus
 import kotlinx.coroutines.CoroutineScope
@@ -22,16 +20,13 @@ import java.util.concurrent.atomic.AtomicLong
 /**
  * Dedicated BLE Transmission Controller for characteristic `0x5352` (`Value Handle 0x0022`).
  *
- * Enforces strict ECU / Cluster safety rules:
- * 1. Frame Validation Guard:
- *    Every outgoing payload must be exactly 20 bytes (`IqubeBleSpec.STANDARD_FRAME_SIZE`) and
- *    use either a verified `0x5A ... 0xFF` control header (`5A F1 00 ... FF`) or a verified
- *    SmartXonnect ASCII command header (`[RU`, `[JD`, `[\W`, `[]C`).
- *    Arbitrary unverified byte injection is rejected before reaching GATT.
- * 2. Serialized FIFO Write Queue with 500ms ACK Flow Control:
- *    Never issues concurrent GATT writes on `0x0022`. Each `ATT Write Request (0x12)` waits
- *    for `ATT Write Response (0x13)` (`onCharacteristicWrite`) or times out after `500 ms`
- *    (matching Packet `#1676` supervision timeout detection).
+ * Enforces the 100% verified outgoing 20-byte frame formats (every frame ends with `packet[19] = 0xFF`):
+ * 1. Initial Handshake (`[RU`): `[0x5B, 0x52, 0x55, 0x01, ...ascii("IQUBE_OSS"), ...0x00, 0xFF]`
+ * 2. Periodic Clock Sync Heartbeat (`[JD`, every 1.8s): `[0x5B, 0x4A, 0x44, hours, minutes, seconds, 0x01, 0, ..., 0, 0xFF]`
+ * 3. Live GPS Location Dump (`[\` + 17 ASCII chars + `0xFF`): `[0x5B, 0x5C, ...ascii(localityName.slice(0, 17)), ...0x00, 0xFF]`
+ * 4. 3 Verified Trip Control Buttons (`Switch to Trip A`, `Switch to Trip B`, `Reset Active Trip (A/B)`):
+ *    `[0x5A, 0xF1, 0x00, subCmd, 0, ..., 0, 0xFF]`
+ * 5. Incoming Call Cluster Alert (`[\` + `"CALL:" + firstName` up to 17 ASCII chars + `0xFF` and `[]C` frame).
  */
 class IqubeCommandDispatcher(
     private val scope: CoroutineScope,
@@ -53,8 +48,9 @@ class IqubeCommandDispatcher(
     val queueDepth: StateFlow<Int> = _queueDepth.asStateFlow()
 
     /**
-     * Validates that a 20-byte outgoing command frame strictly conforms to the reverse-engineered
-     * TVS iQube SmartXonnect write protocol before transmission to Handle 0x0022 / 0x5352.
+     * Validates that a 20-byte outgoing command frame strictly conforms to the verified
+     * TVS iQube SmartXonnect write protocol (including mandatory `Byte 19 = 0xFF` trailer)
+     * before transmission to Handle 0x0022 / 0x5352.
      */
     fun validateOutgoingFrame(payload: ByteArray): Result<ByteArray> {
         if (payload.size != IqubeBleSpec.STANDARD_FRAME_SIZE) {
@@ -63,32 +59,38 @@ class IqubeCommandDispatcher(
             )
         }
 
+        // Mandatory Frame Trailer Rule: Every 20-byte packet must end with Byte 19 = 0xFF
+        if (payload[19] != IqubeBleSpec.FOOTER_DELIMITER) {
+            return Result.failure(
+                IllegalArgumentException("Frame rejected: Byte 19 must be 0xFF trailer.")
+            )
+        }
+
         val b0 = payload[0]
         val b1 = payload[1]
         val b2 = payload[2]
 
-        // Case A: 0x5A binary control frame (must have 0x5A header and 0xFF footer at index 19)
+        // Case A: 0x5A binary control frame ([0x5A, 0xF1, 0x00, subCmd, ..., 0xFF])
         if (b0 == IqubeBleSpec.HEADER_TELEMETRY) {
-            if (payload[19] != IqubeBleSpec.FOOTER_DELIMITER) {
-                return Result.failure(
-                    IllegalArgumentException("0x5A command frame must terminate with 0xFF at Byte 19.")
-                )
-            }
             return Result.success(payload.copyOf())
         }
 
-        // Case B: 0x5B ('[') SmartXonnect 3-byte ASCII-prefixed frame ([RU, [JD, [\W, []C)
+        // Case B: 0x5B ('[') SmartXonnect frame:
+        // - [RU (0x5B, 0x52, 0x55): Initial Handshake
+        // - [JD (0x5B, 0x4A, 0x44): Periodic Clock Sync Heartbeat
+        // - [\  (0x5B, 0x5C, ...17B ASCII, 0xFF): Cluster Location / Call Display Packet
+        // - []C (0x5B, 0x5D, 0x43, ...15B ASCII, 0xFF): Secondary Call Notification Frame
         if (b0 == IqubeBleSpec.HEADER_ASCII_CMD) {
             val isHandshake = b1 == 0x52.toByte() && b2 == 0x55.toByte() // [RU
             val isHeartbeat = b1 == 0x4A.toByte() && b2 == 0x44.toByte() // [JD
-            val isNavFeeder = b1 == 0x5C.toByte() && b2 == 0x57.toByte() // [\W
-            val isCallerAlert = b1 == 0x5D.toByte() && b2 == 0x43.toByte() // []C
+            val isLocationOrCall = b1 == 0x5C.toByte()                   // [\ + 17B ASCII + 0xFF
+            val isCallerFrame = b1 == 0x5D.toByte() && b2 == 0x43.toByte() // []C
 
-            if (isHandshake || isHeartbeat || isNavFeeder || isCallerAlert) {
+            if (isHandshake || isHeartbeat || isLocationOrCall || isCallerFrame) {
                 return Result.success(payload.copyOf())
             }
             return Result.failure(
-                IllegalArgumentException("Unrecognized 0x5B ASCII prefix. Allowed: [RU, [JD, [\\W, []C.")
+                IllegalArgumentException("Unrecognized 0x5B header. Allowed: [RU, [JD, [\\ (5B 5C), or []C.")
             )
         }
 
@@ -98,7 +100,8 @@ class IqubeCommandDispatcher(
     }
 
     /**
-     * 1. Initial Session Handshake (`5B 52 55` / `[RU`) sent once at +1.45s after GATT setup.
+     * 1. Initial Session Handshake (`[RU`):
+     *    `[0x5B, 0x52, 0x55, 0x01, ...ascii("IQUBE_OSS"), ...0x00, 0xFF]`
      */
     fun buildInitialHandshakeFrame(riderAlias: String = "IQUBE_OSS"): ByteArray {
         val frame = ByteArray(IqubeBleSpec.STANDARD_FRAME_SIZE)
@@ -109,35 +112,13 @@ class IqubeCommandDispatcher(
         val ascii = riderAlias.toByteArray(StandardCharsets.US_ASCII)
         val len = minOf(ascii.size, 15)
         System.arraycopy(ascii, 0, frame, 4, len)
-        frame[19] = IqubeBleSpec.FOOTER_DELIMITER
-        return frame
-    }
-
-    /**
-     * 2. Trip Cycle / Trip Reset / Dashboard Lamp Command (`5A F1 00 <subCmd> ... FF`).
-     *    - `subCommand = 0x01`: Cycle Trip A / Trip B
-     *    - `subCommand = 0x02`: Reset Active Trip Meter
-     *    - `subCommand = 0x03`: Toggle Dashboard Cluster Lamp
-     */
-    fun buildTripControlFrame(subCommand: Byte): ByteArray {
-        val frame = ByteArray(IqubeBleSpec.STANDARD_FRAME_SIZE)
-        frame[0] = IqubeBleSpec.HEADER_TELEMETRY // 0x5A
-        frame[1] = 0xF1.toByte()                 // Trip / Cluster Command Opcode
-        frame[2] = 0x00                          // Reserved
-        frame[3] = subCommand                    // 0x01 = Cycle, 0x02 = Reset, 0x03 = Lamp
-        frame[4] = 0x01                          // Payload length
-        // Compute simple XOR checksum in byte 18
-        var xor: Int = 0
-        for (i in 0..17) {
-            xor = xor xor (frame[i].toInt() and 0xFF)
-        }
-        frame[18] = xor.toByte()
         frame[19] = IqubeBleSpec.FOOTER_DELIMITER // 0xFF
         return frame
     }
 
     /**
-     * 3. Periodic Dashboard / Rider Time Sync Heartbeat (`5B 4A 44` / `[JD`, every ~1.8s).
+     * 2. Periodic Clock Sync Heartbeat (`[JD`, every 1.8s):
+     *    `[0x5B, 0x4A, 0x44, hours, minutes, seconds, 0x01, 0, ..., 0, 0xFF]`
      */
     fun buildHeartbeatSyncFrame(): ByteArray {
         val cal = Calendar.getInstance()
@@ -148,66 +129,76 @@ class IqubeCommandDispatcher(
         frame[3] = cal.get(Calendar.HOUR_OF_DAY).toByte()
         frame[4] = cal.get(Calendar.MINUTE).toByte()
         frame[5] = cal.get(Calendar.SECOND).toByte()
-        frame[6] = 0x01 // Rider telemetry link active flag
-        frame[19] = IqubeBleSpec.FOOTER_DELIMITER
+        frame[6] = 0x01
+        frame[19] = IqubeBleSpec.FOOTER_DELIMITER // 0xFF
         return frame
     }
 
     /**
-     * 4. Turn-by-Turn Navigation Feeder (`5B 5C 57` / `[\W` or `5A ... FF` framing).
+     * 3. Live GPS Location Dump (`[\` + up to 17 ASCII chars in `Bytes 2..18` + `Byte 19 = 0xFF`):
+     *    `[0x5B, 0x5C, ...ascii(localityName.slice(0, 17)), ...0x00, 0xFF]`
      */
-    fun buildNavigationFrame(
-        turnIcon: NavigationTurnIcon,
-        distanceMeters: Int,
-        roadName: String,
-        use5AEnvelope: Boolean = false
-    ): ByteArray {
+    fun buildClusterLocationPacket(locationName: String): ByteArray {
+        val packet = ByteArray(IqubeBleSpec.STANDARD_FRAME_SIZE) // zero-filled (0x00 padded)
+        packet[0] = 0x5B // '['
+        packet[1] = 0x5C // '\' Location Frame ID
+        val cleanAscii = locationName
+            .replace(Regex("[^\\x20-\\x7E]"), "")
+            .trim()
+            .take(17)
+        val asciiBytes = cleanAscii.toByteArray(StandardCharsets.US_ASCII)
+        System.arraycopy(asciiBytes, 0, packet, 2, minOf(asciiBytes.size, 17))
+        packet[19] = IqubeBleSpec.FOOTER_DELIMITER // 0xFF mandatory trailer
+        return packet
+    }
+
+    /**
+     * 4. Three Verified Trip Control Buttons (`Switch to Trip A`, `Switch to Trip B`, `Reset Active Trip (A/B)`):
+     *    `[0x5A, 0xF1, 0x00, subCmd, 0, ..., 0, 0xFF]`
+     */
+    fun buildTripControlFrame(subCommand: Byte): ByteArray {
         val frame = ByteArray(IqubeBleSpec.STANDARD_FRAME_SIZE)
-        val clampedDist = distanceMeters.coerceIn(0, 65535)
-        if (use5AEnvelope) {
-            frame[0] = IqubeBleSpec.HEADER_TELEMETRY // 0x5A
-            frame[1] = 0x57                          // Nav opcode
-            frame[2] = turnIcon.id
-            frame[3] = (clampedDist and 0xFF).toByte()
-            frame[4] = ((clampedDist shr 8) and 0xFF).toByte()
-            val ascii = roadName.trim().toByteArray(StandardCharsets.US_ASCII)
-            val copyLen = minOf(ascii.size, 14)
-            System.arraycopy(ascii, 0, frame, 5, copyLen)
-            frame[19] = IqubeBleSpec.FOOTER_DELIMITER
-        } else {
-            frame[0] = 0x5B // '['
-            frame[1] = 0x5C // '\'
-            frame[2] = 0x57 // 'W'
-            frame[3] = turnIcon.id
-            frame[4] = (clampedDist and 0xFF).toByte()
-            frame[5] = ((clampedDist shr 8) and 0xFF).toByte()
-            val ascii = roadName.trim().toByteArray(StandardCharsets.US_ASCII)
-            val copyLen = minOf(ascii.size, 13)
-            System.arraycopy(ascii, 0, frame, 6, copyLen)
-            frame[19] = IqubeBleSpec.FOOTER_DELIMITER
-        }
+        frame[0] = IqubeBleSpec.HEADER_TELEMETRY // 0x5A
+        frame[1] = 0xF1.toByte()                 // Trip Control Opcode
+        frame[2] = 0x00                          // Reserved
+        frame[3] = subCommand                    // 0x03 = Switch Trip A, 0x01 = Switch Trip B, 0x02 = Reset Active Trip
+        frame[19] = IqubeBleSpec.FOOTER_DELIMITER // 0xFF mandatory trailer
         return frame
     }
 
     /**
-     * 5. Caller ID / SMS / Alert Cluster Banner (`5B 5D 43` / `[]C`).
+     * 5A. Incoming Call Cluster Location Override (`0x5B 0x5C` + `"CALL:" + firstName` + `0xFF`):
+     *     Extracts caller's 1st name and formats up to 17 ASCII chars into Bytes 2..18 with Byte 19 = 0xFF.
      */
-    fun buildCallerAlertFrame(alertType: ClusterAlertType, callerOrMessageText: String): ByteArray {
+    fun buildIncomingCallClusterPacket(fullCallerName: String): ByteArray {
+        val firstName = fullCallerName.trim()
+            .split(Regex("\\s+"))
+            .firstOrNull()
+            ?.replace(Regex("[^\\x20-\\x7E]"), "")
+            ?.ifBlank { "Caller" } ?: "Caller"
+        return buildClusterLocationPacket("CALL:$firstName")
+    }
+
+    /**
+     * 5B. Secondary Incoming Call Alert Packet (`[]C` + caller's 1st name + `0xFF`):
+     *     `[0x5B, 0x5D, 0x43, 0x01, ...asciiBytes(firstName.slice(0, 15)), ...0x00, 0xFF]`
+     */
+    fun buildCallerAlertFrame0x5D(firstName: String): ByteArray {
         val frame = ByteArray(IqubeBleSpec.STANDARD_FRAME_SIZE)
         frame[0] = 0x5B // '['
         frame[1] = 0x5D // ']'
         frame[2] = 0x43 // 'C'
-        frame[3] = alertType.id
-        val ascii = callerOrMessageText.trim().toByteArray(StandardCharsets.US_ASCII)
-        val copyLen = minOf(ascii.size, 15)
-        System.arraycopy(ascii, 0, frame, 4, copyLen)
-        frame[19] = IqubeBleSpec.FOOTER_DELIMITER
+        frame[3] = 0x01 // Incoming call alert flag
+        val cleanAscii = firstName
+            .replace(Regex("[^\\x20-\\x7E]"), "")
+            .trim()
+            .take(15)
+        val asciiBytes = cleanAscii.toByteArray(StandardCharsets.US_ASCII)
+        System.arraycopy(asciiBytes, 0, frame, 4, minOf(asciiBytes.size, 15))
+        frame[19] = IqubeBleSpec.FOOTER_DELIMITER // 0xFF mandatory trailer
         return frame
     }
 
-    /**
-     * Validates and enqueues a command into the serialized FIFO Write Queue.
-     */
     fun enqueueCommand(label: String, rawPayload: ByteArray): Result<QueuedWriteCommand> {
         val now = System.currentTimeMillis()
         val id = commandIdGenerator.getAndIncrement()
@@ -262,7 +253,6 @@ class IqubeCommandDispatcher(
             if (nextCmd != null) {
                 recordCommandUpdate(nextCmd)
 
-                // Start 500ms ATT Write Response (0x13) watchdog timer
                 ackTimeoutJob?.cancel()
                 ackTimeoutJob = scope.launch {
                     delay(IqubeBleSpec.WRITE_ACK_TIMEOUT_MS)
@@ -289,10 +279,6 @@ class IqubeCommandDispatcher(
         }
     }
 
-    /**
-     * Called by `BluetoothGattCallback.onCharacteristicWrite` (ATT Write Response 0x13)
-     * or by the Replay/Loopback ACK handler.
-     */
     fun onWriteResponseReceived(gattStatus: Int = 0) {
         scope.launch {
             val completedId: Long?

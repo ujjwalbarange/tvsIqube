@@ -22,6 +22,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Bluetooth
 import androidx.compose.material.icons.filled.BluetoothConnected
 import androidx.compose.material.icons.filled.BluetoothDisabled
+import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.LockOpen
 import androidx.compose.material.icons.filled.PlayArrow
@@ -62,34 +63,39 @@ fun TopConnectionHeader(
     negotiatedMtu: Int?,
     isIgnitionUnlocked: Boolean?,
     rideMode: RideMode?,
+    isCharging: Boolean,
     isLinkDegraded: Boolean,
     linkWarningMessage: String?,
     onConnectBleClick: () -> Unit,
-    onReplayHciClick: () -> Unit,
+    onReplayRidingClick: () -> Unit,
+    onReplayChargingClick: () -> Unit,
     onDisconnectClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val isActive = connectionPhase == BleConnectionPhase.STREAMING_ACTIVE ||
-        connectionPhase == BleConnectionPhase.REPLAYING_HCI_LOG
+        connectionPhase == BleConnectionPhase.REPLAYING_RIDING_LOG ||
+        connectionPhase == BleConnectionPhase.REPLAYING_CHARGING_LOG
 
     val statusDotColor = when {
         isLinkDegraded -> EnergeticCoral
         connectionPhase == BleConnectionPhase.STREAMING_ACTIVE -> NeonMint
-        connectionPhase == BleConnectionPhase.REPLAYING_HCI_LOG -> ElectricCyan
+        connectionPhase == BleConnectionPhase.REPLAYING_CHARGING_LOG -> NeonMint
+        connectionPhase == BleConnectionPhase.REPLAYING_RIDING_LOG -> ElectricCyan
         connectionPhase == BleConnectionPhase.DISCONNECTED -> TextSecondary
         else -> AmberWarning
     }
 
     val statusLabel = when (connectionPhase) {
-        BleConnectionPhase.DISCONNECTED -> "BLE DISCONNECTED"
-        BleConnectionPhase.SCANNING -> "SCANNING 0x5354…"
+        BleConnectionPhase.DISCONNECTED -> "OFFLINE (LAST SEEN)"
+        BleConnectionPhase.SCANNING -> "SCANNING TVSiQUBE…"
         BleConnectionPhase.CONNECTING_GATT -> "CONNECTING GATT…"
-        BleConnectionPhase.DISCOVERING_SERVICES -> "DISCOVERING SERVICES…"
-        BleConnectionPhase.ENABLING_CCCD -> "WRITING CCCD 0x001F…"
-        BleConnectionPhase.NEGOTIATING_MTU -> "EXCHANGING MTU 517…"
-        BleConnectionPhase.SENDING_HANDSHAKE -> "HANDSHAKE [RU 0x0022…"
-        BleConnectionPhase.STREAMING_ACTIVE -> "BLE CONNECTED"
-        BleConnectionPhase.REPLAYING_HCI_LOG -> "HCI LOG REPLAY (LIVE PARSER)"
+        BleConnectionPhase.DISCOVERING_SERVICES -> "SERVICE 5456534d…"
+        BleConnectionPhase.ENABLING_CCCD -> "CCCD 0x001F (0x5354)…"
+        BleConnectionPhase.NEGOTIATING_MTU -> "EXCHANGING MTU 247…"
+        BleConnectionPhase.SENDING_HANDSHAKE -> "HANDSHAKE [RU 0xFF…"
+        BleConnectionPhase.STREAMING_ACTIVE -> if (isCharging) "BLE CHARGING (0x5354)" else "BLE CONNECTED"
+        BleConnectionPhase.REPLAYING_RIDING_LOG -> "RIDE CAPTURE (btsnooz)"
+        BleConnectionPhase.REPLAYING_CHARGING_LOG -> "CHARGE CAPTURE (38→42%)"
         BleConnectionPhase.RECONNECTING_BACKOFF -> "AUTO-RECONNECTING…"
     }
 
@@ -105,7 +111,7 @@ fun TopConnectionHeader(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            // Left: Scooter Identity & MAC
+            // Left: Scooter Identity (from 0x5A 0x7D "TVSiQUBEJI573") & MAC
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Box(
                     modifier = Modifier
@@ -133,10 +139,10 @@ fun TopConnectionHeader(
                             text = deviceName,
                             style = MaterialTheme.typography.titleMedium,
                             fontWeight = FontWeight.Bold,
-                            color = TextPrimary
+                            color = TextPrimary,
+                            modifier = Modifier.testTag("header_vehicle_id_text")
                         )
                         Spacer(modifier = Modifier.width(6.dp))
-                        // Ignition / Lock status pill derived strictly from 0x7D telemetry byte
                         val lockIcon = if (isIgnitionUnlocked == true) Icons.Default.LockOpen else Icons.Default.Lock
                         val lockTint = if (isIgnitionUnlocked == true) NeonMint else TextSecondary
                         Icon(
@@ -147,7 +153,7 @@ fun TopConnectionHeader(
                         )
                     }
                     Text(
-                        text = "$deviceMac • ${rssiDbm?.let { "$it dBm" } ?: "-- dBm"} • MTU ${negotiatedMtu ?: "--"}",
+                        text = "$deviceMac • ${rssiDbm?.let { "$it dBm" } ?: "-- dBm"} • ST:0x5354 SR:0x5352",
                         style = MaterialTheme.typography.labelSmall,
                         color = TextSecondary
                     )
@@ -181,7 +187,7 @@ fun TopConnectionHeader(
 
         Spacer(modifier = Modifier.height(10.dp))
 
-        // Action Bar: Scan & Connect BLE, Replay Captured btsnooz_hci.log, Ride Mode badge
+        // Action Bar: Scan BLE, Ride Replay (btsnooz_hci.log), Charge Replay (btsnoop_hci.log), Ride/Charge Mode badge
         FlowRow(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -191,45 +197,61 @@ fun TopConnectionHeader(
                 connectionPhase == BleConnectionPhase.RECONNECTING_BACKOFF
             ) {
                 HeaderActionButton(
-                    label = "Scan BLE (0x5354)",
+                    label = "Scan BLE (TVSiQUBE)",
                     icon = Icons.Default.Bluetooth,
                     accentColor = NeonMint,
                     testTag = "connect_ble_button",
                     onClick = onConnectBleClick
                 )
                 HeaderActionButton(
-                    label = "Replay btsnooz_hci.log",
+                    label = "Ride Replay (91%)",
                     icon = Icons.Default.PlayArrow,
                     accentColor = ElectricCyan,
                     testTag = "replay_hci_button",
-                    onClick = onReplayHciClick
+                    onClick = onReplayRidingClick
+                )
+                HeaderActionButton(
+                    label = "Charge Replay (38→42%)",
+                    icon = Icons.Default.Bolt,
+                    accentColor = AmberWarning,
+                    testTag = "replay_charging_button",
+                    onClick = onReplayChargingClick
                 )
             } else {
                 HeaderActionButton(
-                    label = if (connectionPhase == BleConnectionPhase.REPLAYING_HCI_LOG) "Stop HCI Replay" else "Disconnect BLE",
+                    label = if (connectionPhase == BleConnectionPhase.STREAMING_ACTIVE) "Disconnect BLE" else "Stop Replay",
                     icon = Icons.Default.Stop,
                     accentColor = EnergeticCoral,
                     testTag = "disconnect_ble_button",
                     onClick = onDisconnectClick
                 )
-                if (connectionPhase != BleConnectionPhase.REPLAYING_HCI_LOG) {
+                if (connectionPhase != BleConnectionPhase.REPLAYING_RIDING_LOG) {
                     HeaderActionButton(
-                        label = "Replay btsnooz_hci.log",
+                        label = "Ride Replay",
                         icon = Icons.Default.PlayArrow,
                         accentColor = ElectricCyan,
                         testTag = "switch_to_replay_button",
-                        onClick = onReplayHciClick
+                        onClick = onReplayRidingClick
+                    )
+                }
+                if (connectionPhase != BleConnectionPhase.REPLAYING_CHARGING_LOG) {
+                    HeaderActionButton(
+                        label = "Charge Replay (38→42%)",
+                        icon = Icons.Default.Bolt,
+                        accentColor = AmberWarning,
+                        testTag = "switch_to_charging_replay_button",
+                        onClick = onReplayChargingClick
                     )
                 }
             }
 
-            // Live Ride Mode Pill (from 0x5A 0x7D)
-            val modeText = rideMode?.label ?: "MODE: --"
-            val modeColor = when (rideMode) {
-                RideMode.POWER -> EnergeticCoral
-                RideMode.ECO -> NeonMint
-                RideMode.PARK -> AmberWarning
-                null -> TextSecondary
+            // Live State Badge (Charging 0x06/0x01 vs Ride Mode)
+            val modeText = if (isCharging) "CHARGING (0x06 / 0x01)" else (rideMode?.label ?: "ECO MODE")
+            val modeColor = when {
+                isCharging -> NeonMint
+                rideMode == RideMode.POWER -> EnergeticCoral
+                rideMode == RideMode.ECO -> ElectricCyan
+                else -> TextSecondary
             }
             Box(
                 modifier = Modifier

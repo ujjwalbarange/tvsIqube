@@ -10,6 +10,7 @@ import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
 import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.Context
@@ -18,46 +19,46 @@ import android.location.LocationListener
 import android.location.LocationManager
 import android.os.Build
 import android.os.Looper
+import com.example.model.ActiveTripSession
 import com.example.model.BleConnectionPhase
-import com.example.model.ClusterAlertType
+import com.example.model.ChargingMonitorState
 import com.example.model.GpsBleFusionSample
+import com.example.model.IncomingCallRelayState
 import com.example.model.IqubeBleSpec
 import com.example.model.LastParkedLocation
-import com.example.model.NavigationTurnIcon
+import com.example.model.LastSeenScooterState
+import com.example.model.RideMode
+import com.example.model.SavedChargingSession
+import com.example.model.SavedTripRecord
+import com.example.model.TripSubcommandConfig
+import com.example.model.TrueRangeCalculation
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.util.UUID
+import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
 
 /**
- * Full Lifecycle BLE GATT & Telemetry Controller for TVS iQube (`F8:55:48:72:96:DA`).
- *
- * Implements:
- * 1. 6-Step Initialization State Machine:
- *    Scan -> Connect GATT -> Discover Services (Static or Dynamic Service 3 matching) ->
- *    Write `0x0100` to CCCD `0x2902` -> Request MTU `517` (negotiates `247`) ->
- *    Send `[RU` Handshake at `+1.45s` -> Start Periodic `[JD` Heartbeat & Telemetry Stream.
- * 2. Link Watchdog & Supervision Timeout (`0x08`) Detection:
- *    Monitors packet silence (`>2,500 ms`) and write ACK timeout (`>500 ms`), surfaces a
- *    Link Degraded banner, and pauses background `[JD` heartbeats.
- * 3. Exponential Backoff Auto-Reconnect & GATT Error 133 Prevention:
- *    Always calls `gatt.disconnect()` followed by `gatt.close()` and nullifies references
- *    before scheduling a 30-second bounded reconnect attempt.
- * 4. GPS + BLE Speed Fusion & Automatic "Last Parked Location" Capture on Disconnect.
+ * Full Lifecycle BLE GATT, Unfiltered 20-Byte Telemetry Controller, Live Charging Predictor,
+ * Incoming Call Cluster Relay, Offline Last-Seen Tracker & Trip Logger for TVS iQube (`F8:55:48:72:96:DA`).
  */
 class IqubeBleManager(
     private val context: Context,
-    val packetParser: IqubePacketParser = IqubePacketParser()
+    val packetParser: IqubePacketParser = IqubePacketParser(),
+    val tripRepository: TrueRangeAndTripRepository = TrueRangeAndTripRepository(context)
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
@@ -73,15 +74,17 @@ class IqubeBleManager(
     private var scanJob: Job? = null
     private var replayJob: Job? = null
     private var heartbeatJob: Job? = null
+    private var locationSyncJob: Job? = null
     private var watchdogJob: Job? = null
     private var reconnectJob: Job? = null
+    private var callAutoClearJob: Job? = null
     private var reconnectAttemptCount = 0
 
     // Connection & Link StateFlows
     private val _connectionPhase = MutableStateFlow(BleConnectionPhase.DISCONNECTED)
     val connectionPhase: StateFlow<BleConnectionPhase> = _connectionPhase.asStateFlow()
 
-    private val _connectedDeviceName = MutableStateFlow(IqubeBleSpec.DEFAULT_DEVICE_ALIAS)
+    private val _connectedDeviceName = MutableStateFlow(IqubeBleSpec.CLUSTER_VEHICLE_ID_DEFAULT)
     val connectedDeviceName: StateFlow<String> = _connectedDeviceName.asStateFlow()
 
     private val _connectedDeviceMac = MutableStateFlow(IqubeBleSpec.TARGET_MAC_ADDRESS)
@@ -93,7 +96,7 @@ class IqubeBleManager(
     private val _negotiatedMtu = MutableStateFlow<Int?>(null)
     val negotiatedMtu: StateFlow<Int?> = _negotiatedMtu.asStateFlow()
 
-    private val _discoveredServiceUuid = MutableStateFlow<String>(IqubeBleSpec.SERVICE_UUID_SMARTXONNECT)
+    private val _discoveredServiceUuid = MutableStateFlow(IqubeBleSpec.SERVICE_UUID_SMARTXONNECT)
     val discoveredServiceUuid: StateFlow<String> = _discoveredServiceUuid.asStateFlow()
 
     private val _isLinkDegraded = MutableStateFlow(false)
@@ -108,14 +111,52 @@ class IqubeBleManager(
     private val _heartbeatEnabled = MutableStateFlow(true)
     val heartbeatEnabled: StateFlow<Boolean> = _heartbeatEnabled.asStateFlow()
 
+    private val _autoLocationSyncEnabled = MutableStateFlow(true)
+    val autoLocationSyncEnabled: StateFlow<Boolean> = _autoLocationSyncEnabled.asStateFlow()
+
     private val _fragmentedSliceTestEnabled = MutableStateFlow(false)
     val fragmentedSliceTestEnabled: StateFlow<Boolean> = _fragmentedSliceTestEnabled.asStateFlow()
 
-    // Replay customization state for testing Trip Reset / Lamp toggle in HCI Replay mode
-    private var replayTripATenths = 184
-    private var replayTripBTenths = 62
-    private var replayOdoTenths = 17504
-    private var replayLampOn = false
+    // Verified Trip Subcommand Configuration (`5A F1 00 <subCmd> ... FF`)
+    private val _tripSubcommandConfig = MutableStateFlow(TripSubcommandConfig())
+    val tripSubcommandConfig: StateFlow<TripSubcommandConfig> = _tripSubcommandConfig.asStateFlow()
+
+    // Cluster Location Display (`0x5B 0x5C` + 17-byte ASCII locality + `0xFF`)
+    private val _detectedLocalityName = MutableStateFlow("Sonegaon")
+    val detectedLocalityName: StateFlow<String> = _detectedLocalityName.asStateFlow()
+
+    private val _customLocationOverride = MutableStateFlow("")
+    val customLocationOverride: StateFlow<String> = _customLocationOverride.asStateFlow()
+
+    private val _lastSyncedClusterLocation = MutableStateFlow<String?>(null)
+    val lastSyncedClusterLocation: StateFlow<String?> = _lastSyncedClusterLocation.asStateFlow()
+
+    // Incoming Call Relay State (`1st Name + Call Symbol` on `0x5B 0x5C ... 0xFF`)
+    private val _incomingCallState = MutableStateFlow(IncomingCallRelayState())
+    val incomingCallState: StateFlow<IncomingCallRelayState> = _incomingCallState.asStateFlow()
+
+    // Active Connect-to-Disconnect Trip Session
+    private val _activeTripSession = MutableStateFlow<ActiveTripSession?>(null)
+    val activeTripSession: StateFlow<ActiveTripSession?> = _activeTripSession.asStateFlow()
+
+    // Active Charging Session & 1% Step Timing Tracking
+    private var chargingSessionStartMs: Long? = null
+    private val _chargingSessionStartSoc = MutableStateFlow<Int?>(null)
+    private var lastChargingSocValue: Int? = null
+    private var lastChargingSocStepTimestampMs: Long? = null
+    private var firstChargingTickSeen: Boolean = false
+    private val _liveChargingStepDurationsSec = MutableStateFlow<List<Double>>(emptyList())
+
+    // Selected Range Display Mode on Cockpit (Eco vs Power)
+    private val _selectedRangeMode = MutableStateFlow(RideMode.ECO)
+    val selectedRangeMode: StateFlow<RideMode> = _selectedRangeMode.asStateFlow()
+
+    // Replay state for Riding (`btsnooz_hci.log`) and Charging (`btsnoop_hci.log`)
+    private var replayTripATenths = HciLogReplayDataset.CHARGING_CAPTURE_TRIP_A_TENTHS_KM // 0.3 km
+    private var replayTripBTenths = HciLogReplayDataset.CHARGING_CAPTURE_TRIP_B_TENTHS_KM // 1.0 km
+    private var replayOdoTenths = HciLogReplayDataset.CHARGING_CAPTURE_ODO_TENTHS_KM      // 359252 = 35,925.2 km
+    private var replayBatterySoc = 91
+    private var replayClusterRangeTenths = 960 // 96.0 km
     private var replayCharging = false
 
     // GPS + BLE Ride Logger & Last Parked State
@@ -131,11 +172,146 @@ class IqubeBleManager(
     private val _gpsFusionSamples = MutableStateFlow<List<GpsBleFusionSample>>(emptyList())
     val gpsFusionSamples: StateFlow<List<GpsBleFusionSample>> = _gpsFusionSamples.asStateFlow()
 
+    val lastSeenState: StateFlow<LastSeenScooterState?> = tripRepository.lastSeenState
+
+    // Reactive True Range Calculation Engine combining live telemetry (or offline Last Seen battery %), savedTrips, and activeTripSession
+    val trueRangeState: StateFlow<TrueRangeCalculation> = combine(
+        packetParser.telemetryState,
+        tripRepository.savedTrips,
+        _activeTripSession,
+        tripRepository.lastSeenState
+    ) { tele, savedTrips, activeSession, lastSeen ->
+        val integratedKm = tele.integratedDistanceMeters / 1000.0
+        val odoDeltaKm = if (activeSession?.startOdometerKm != null && tele.odometerKm != null) {
+            max(0.0, tele.odometerKm - activeSession.startOdometerKm)
+        } else 0.0
+        val activeDistKm = max(integratedKm, odoDeltaKm)
+        // Use live battery % when connected, or fallback to Last Seen battery % when offline
+        val effectiveBatteryPct = tele.batteryPercent ?: lastSeen?.batteryPct
+
+        TrueRangeAndTripRepository.computeTrueRange(
+            currentBatteryPct = effectiveBatteryPct,
+            savedTrips = savedTrips,
+            activeTripDistanceKm = activeDistKm,
+            activeTripStartBatteryPct = activeSession?.startBatteryPct,
+            activeTripMode = tele.rideMode ?: RideMode.ECO
+        )
+    }.stateIn(
+        scope = scope,
+        started = SharingStarted.Eagerly,
+        initialValue = TrueRangeAndTripRepository.computeTrueRange(
+            currentBatteryPct = tripRepository.lastSeenState.value?.batteryPct,
+            savedTrips = tripRepository.savedTrips.value
+        )
+    )
+
+    // Reactive 3-Tier Charging Monitor State
+    val chargingMonitorState: StateFlow<ChargingMonitorState> = combine(
+        packetParser.telemetryState,
+        _chargingSessionStartSoc,
+        _liveChargingStepDurationsSec,
+        tripRepository.savedChargingSessions
+    ) { tele, startSoc, liveSteps, savedSessions ->
+        TrueRangeAndTripRepository.computeChargingMonitorState(
+            isCharging = tele.isCharging,
+            currentBatteryPct = tele.batteryPercent,
+            clusterRangeKm = tele.clusterRangeKm,
+            sessionStartBatteryPct = startSoc,
+            liveStepDurationsSec = liveSteps,
+            savedChargingSessions = savedSessions
+        )
+    }.stateIn(
+        scope = scope,
+        started = SharingStarted.Eagerly,
+        initialValue = TrueRangeAndTripRepository.computeChargingMonitorState(
+            isCharging = false,
+            currentBatteryPct = null,
+            clusterRangeKm = null,
+            sessionStartBatteryPct = null,
+            liveStepDurationsSec = emptyList(),
+            savedChargingSessions = tripRepository.savedChargingSessions.value
+        )
+    )
+
     val commandDispatcher = IqubeCommandDispatcher(
         scope = scope,
         performGattWrite = ::performHardwareOrReplayWrite,
         onWriteAckTimeout = ::onWriteAckTimeoutDetected
     )
+
+    init {
+        scope.launch {
+            packetParser.telemetryState.collect { tele ->
+                // 1. Dynamically update header Vehicle Identifier string from 0x5A 0x7D ("TVSiQUBEJI573")
+                if (!tele.vehicleIdString.isNullOrBlank()) {
+                    _connectedDeviceName.value = tele.vehicleIdString
+                }
+
+                // 2. Track live +1% Charging Step Timing when charging is active (0x11 Byte 5 == 0x01 or 0x13 Byte 5 == 0x06)
+                val now = System.currentTimeMillis()
+                if (tele.isCharging && tele.batteryPercent != null) {
+                    val soc = tele.batteryPercent
+                    if (chargingSessionStartMs == null) {
+                        chargingSessionStartMs = now
+                        _chargingSessionStartSoc.value = soc
+                        lastChargingSocValue = soc
+                        lastChargingSocStepTimestampMs = now
+                        firstChargingTickSeen = false
+                    } else {
+                        val prevSoc = lastChargingSocValue
+                        val prevStepMs = lastChargingSocStepTimestampMs
+                        if (prevSoc != null && prevStepMs != null && soc > prevSoc) {
+                            val deltaSec = (now - prevStepMs) / 1000.0
+                            val pctDiff = soc - prevSoc
+                            val secPerPct = deltaSec / pctDiff.toDouble()
+                            // Accept if full step >= 60s, or after 1st boundary tick
+                            if (secPerPct >= 60.0 || firstChargingTickSeen) {
+                                _liveChargingStepDurationsSec.update {
+                                    (it + secPerPct.coerceIn(60.0, 240.0)).takeLast(10)
+                                }
+                            }
+                            firstChargingTickSeen = true
+                            lastChargingSocValue = soc
+                            lastChargingSocStepTimestampMs = now
+                        }
+                    }
+                }
+
+                // 3. Persist Last Seen Scooter State on telemetry updates
+                if (tele.batteryPercent != null && tele.odometerKm != null) {
+                    tripRepository.saveLastSeenState(
+                        LastSeenScooterState(
+                            timestampMs = now,
+                            batteryPct = tele.batteryPercent,
+                            odometerKm = tele.odometerKm,
+                            clusterRangeKm = tele.clusterRangeKm ?: (tele.batteryPercent * 1.0),
+                            tripAKm = tele.tripAKm ?: 0.3,
+                            tripBKm = tele.tripBKm ?: 1.0,
+                            locationName = _detectedLocalityName.value.ifBlank { "Sonegaon" },
+                            wasCharging = tele.isCharging,
+                            vehicleId = tele.vehicleIdString ?: IqubeBleSpec.CLUSTER_VEHICLE_ID_DEFAULT
+                        )
+                    )
+                }
+
+                // 4. Update active Connect-to-Disconnect Trip Session
+                val currentSession = _activeTripSession.value ?: return@collect
+                val speed = tele.speedKmh ?: 0
+                val updatedStartOdo = currentSession.startOdometerKm ?: tele.odometerKm
+                val updatedStartSoc = currentSession.startBatteryPct ?: tele.batteryPercent
+                val updatedMode = if (tele.rideMode == RideMode.POWER) RideMode.POWER else currentSession.dominantRideMode
+
+                _activeTripSession.value = currentSession.copy(
+                    startOdometerKm = updatedStartOdo,
+                    startBatteryPct = updatedStartSoc,
+                    speedSamplesSum = currentSession.speedSamplesSum + speed,
+                    speedSamplesCount = currentSession.speedSamplesCount + (if (tele.speedKmh != null) 1 else 0),
+                    peakSpeedKmh = max(currentSession.peakSpeedKmh, tele.peakSpeedKmh),
+                    dominantRideMode = updatedMode
+                )
+            }
+        }
+    }
 
     private val locationListener = object : LocationListener {
         override fun onLocationChanged(location: Location) {
@@ -145,19 +321,41 @@ class IqubeBleManager(
             } else 0.0
             _currentGpsSpeedKmh.value = gpsKmh
 
-            val tele = packetParser.telemetryState.value
-            val wheelSpeed = tele.speedKmh
-            val sample = GpsBleFusionSample(
-                timestampMs = System.currentTimeMillis(),
-                wheelSpeedKmh = wheelSpeed,
-                gpsSpeedKmh = gpsKmh,
-                deltaKmh = if (wheelSpeed != null) ((wheelSpeed - gpsKmh) * 10.0).roundToInt() / 10.0 else null,
-                batteryPercent = tele.batteryPercent,
-                latitude = location.latitude,
-                longitude = location.longitude
-            )
-            _gpsFusionSamples.update { (listOf(sample) + it).take(35) }
+            scope.launch {
+                val locality = tripRepository.reverseGeocodeLocality(location.latitude, location.longitude)
+                val previousLocality = _detectedLocalityName.value
+                _detectedLocalityName.value = locality
+
+                val isConnected = isActivelyConnectedOrReplaying()
+                // Only auto-push GPS locality when no incoming call is actively ringing on the cluster
+                if (isConnected && _autoLocationSyncEnabled.value && !_incomingCallState.value.isRinging &&
+                    _customLocationOverride.value.isBlank() && locality != previousLocality
+                ) {
+                    dumpLocationToClusterNow(locality)
+                }
+
+                val tele = packetParser.telemetryState.value
+                val wheelSpeed = tele.speedKmh
+                val sample = GpsBleFusionSample(
+                    timestampMs = System.currentTimeMillis(),
+                    wheelSpeedKmh = wheelSpeed,
+                    gpsSpeedKmh = gpsKmh,
+                    deltaKmh = if (wheelSpeed != null) ((wheelSpeed - gpsKmh) * 10.0).roundToInt() / 10.0 else null,
+                    batteryPercent = tele.batteryPercent,
+                    latitude = location.latitude,
+                    longitude = location.longitude,
+                    localityName = locality
+                )
+                _gpsFusionSamples.update { (listOf(sample) + it).take(35) }
+            }
         }
+    }
+
+    private fun isActivelyConnectedOrReplaying(): Boolean {
+        val phase = _connectionPhase.value
+        return phase == BleConnectionPhase.STREAMING_ACTIVE ||
+            phase == BleConnectionPhase.REPLAYING_RIDING_LOG ||
+            phase == BleConnectionPhase.REPLAYING_CHARGING_LOG
     }
 
     fun setAutoReconnect(enabled: Boolean) {
@@ -171,24 +369,123 @@ class IqubeBleManager(
         _heartbeatEnabled.value = enabled
     }
 
+    fun setAutoLocationSyncEnabled(enabled: Boolean) {
+        _autoLocationSyncEnabled.value = enabled
+    }
+
+    fun setCustomLocationOverride(customText: String) {
+        _customLocationOverride.value = customText.take(IqubeBleSpec.MAX_LOCATION_ASCII_BYTES)
+    }
+
+    fun setSelectedRangeMode(mode: RideMode) {
+        _selectedRangeMode.value = mode
+    }
+
+    fun updateTripSubcommandConfig(config: TripSubcommandConfig) {
+        _tripSubcommandConfig.value = config
+    }
+
     fun setFragmentedSliceTestEnabled(enabled: Boolean) {
         _fragmentedSliceTestEnabled.value = enabled
     }
 
-    fun setCustomServiceUuid(uuidString: String) {
-        val trimmed = uuidString.trim()
-        if (trimmed.isNotEmpty()) {
-            _discoveredServiceUuid.value = trimmed
+    fun toggleReplayChargingState() {
+        if (_connectionPhase.value == BleConnectionPhase.REPLAYING_CHARGING_LOG) {
+            startBtsnoozHciLogReplay()
+        } else {
+            startChargingCaptureReplay()
         }
     }
 
-    fun toggleReplayChargingState() {
-        replayCharging = !replayCharging
+    /**
+     * Incoming Call Cluster Relay (`1st Name + Call Symbol` on `0x5B 0x5C ... 0xFF` & `0x5B 0x5D 0x43 ... 0xFF`).
+     * Extracts the caller's first name, pauses background GPS location dumps while ringing,
+     * and pushes `"CALL:<FirstName>"` onto the scooter cluster.
+     */
+    fun triggerIncomingCallAlert(fullCallerName: String) {
+        val cleaned = fullCallerName.trim().ifBlank { "Rahul Sharma" }
+        val firstName = cleaned.split(Regex("\\s+")).firstOrNull()?.replace(Regex("[^\\x20-\\x7E]"), "")?.ifBlank { "Caller" } ?: "Caller"
+        val clusterCallText = "CALL:$firstName".take(IqubeBleSpec.MAX_LOCATION_ASCII_BYTES)
+
+        _incomingCallState.value = IncomingCallRelayState(
+            isRinging = true,
+            fullCallerName = cleaned,
+            extractedFirstName = firstName,
+            clusterFormattedText = clusterCallText,
+            ringStartTimeMs = System.currentTimeMillis()
+        )
+        _lastSyncedClusterLocation.value = clusterCallText
+
+        // 1. Push 0x5B 0x5C location override with Call Symbol + 1st Name
+        commandDispatcher.enqueueCommand(
+            label = "Incoming Call [\\$clusterCallText",
+            rawPayload = commandDispatcher.buildIncomingCallClusterPacket(cleaned)
+        )
+        // 2. Also push 0x5B 0x5D 0x43 ([]C) caller notification frame
+        commandDispatcher.enqueueCommand(
+            label = "Caller Alert []C ($firstName)",
+            rawPayload = commandDispatcher.buildCallerAlertFrame0x5D(firstName)
+        )
+
+        // Auto-clear after 15 seconds if not manually ended, restoring live GPS locality
+        callAutoClearJob?.cancel()
+        callAutoClearJob = scope.launch {
+            delay(15_000L)
+            if (_incomingCallState.value.isRinging) {
+                endIncomingCallAlert()
+            }
+        }
     }
 
     /**
-     * Starts GPS tracking if location permission has been granted by the user.
+     * Ends the active incoming call alert and immediately restores the live GPS locality
+     * (e.g. `"Sonegaon"`) onto the scooter cluster (`0x5B 0x5C ... 0xFF`).
      */
+    fun endIncomingCallAlert() {
+        callAutoClearJob?.cancel()
+        val prev = _incomingCallState.value
+        _incomingCallState.value = prev.copy(isRinging = false)
+        if (isActivelyConnectedOrReplaying()) {
+            dumpLocationToClusterNow()
+        }
+    }
+
+    /**
+     * Simulates an instant `+1%` charging step (with the verified `115.7s` step timing)
+     * so the user can test the Tier 1/2 Baseline -> Tier 3 Live `1%` Step Timing transition on demand.
+     */
+    fun simulateLiveOnePercentChargingStep() {
+        val currentSoc = (packetParser.telemetryState.value.batteryPercent ?: replayBatterySoc).coerceIn(1, 99)
+        val nextSoc = (currentSoc + 1).coerceAtMost(100)
+        replayBatterySoc = nextSoc
+        replayClusterRangeTenths = (nextSoc * 10.7).roundToInt() // ~40.0 km at 38% -> ~45.0 km at 42%
+        replayCharging = true
+
+        if (_chargingSessionStartSoc.value == null) {
+            _chargingSessionStartSoc.value = currentSoc
+            chargingSessionStartMs = System.currentTimeMillis() - 115_700L
+        }
+        _liveChargingStepDurationsSec.update {
+            (it + IqubeBleSpec.VERIFIED_CAPTURE_SEC_PER_PCT).takeLast(10)
+        }
+
+        feedFrameToParser(
+            HciLogReplayDataset.buildBatteryRangeFrame0x13(
+                socPercent = nextSoc,
+                clusterRangeTenthsKm = replayClusterRangeTenths,
+                isCharging = true
+            )
+        )
+        feedFrameToParser(
+            HciLogReplayDataset.buildTripsAndChargingFrame0x11(
+                tripATenthsKm = replayTripATenths,
+                tripBTenthsKm = replayTripBTenths,
+                isChargingActive = true,
+                socMirrorPercent = nextSoc
+            )
+        )
+    }
+
     @SuppressLint("MissingPermission")
     fun startGpsTelemetryFusion() {
         try {
@@ -198,39 +495,43 @@ class IqubeBleManager(
                 locManager.getLastKnownLocation(provider)?.let { loc ->
                     if (_lastKnownLocation.value == null) {
                         _lastKnownLocation.value = loc
+                        scope.launch {
+                            _detectedLocalityName.value =
+                                tripRepository.reverseGeocodeLocality(loc.latitude, loc.longitude)
+                        }
                     }
                 }
             }
             if (locManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
                 locManager.requestLocationUpdates(
                     LocationManager.GPS_PROVIDER,
-                    1000L,
-                    0f,
+                    2000L,
+                    2f,
                     locationListener,
                     Looper.getMainLooper()
                 )
             } else if (locManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)) {
                 locManager.requestLocationUpdates(
                     LocationManager.NETWORK_PROVIDER,
-                    2000L,
-                    0f,
+                    3000L,
+                    5f,
                     locationListener,
                     Looper.getMainLooper()
                 )
             }
         } catch (_: SecurityException) {
-            // Permission not yet granted
         } catch (_: Exception) {
         }
     }
 
     /**
-     * Initiates real BLE scan & GATT connection to TVS iQube (`F8:55:48:72:96:DA` or SmartXonnect UUID).
+     * Initiates real BLE scan & GATT connection to TVS iQube (`TVSiQUBECJI573` / `F8:55:48:72:96:DA` / `5456534d-5647-5341-5342-454e544f5251`).
      */
     @SuppressLint("MissingPermission")
     fun startBleScanAndConnect() {
         stopReplayModeIfNeeded()
         reconnectJob?.cancel()
+        startGpsTelemetryFusion()
 
         val adapter = bluetoothAdapter
         if (adapter == null || !adapter.isEnabled) {
@@ -243,7 +544,6 @@ class IqubeBleManager(
         _linkWarningMessage.value = null
         _connectionPhase.value = BleConnectionPhase.SCANNING
 
-        // Step 1A: Try direct MAC address lookup if already bonded/cached
         try {
             val directDevice = adapter.getRemoteDevice(IqubeBleSpec.TARGET_MAC_ADDRESS)
             if (directDevice != null && directDevice.type != BluetoothDevice.DEVICE_TYPE_UNKNOWN) {
@@ -253,7 +553,6 @@ class IqubeBleManager(
         } catch (_: Exception) {
         }
 
-        // Step 1B: Perform BLE Scanner discovery (30-second bounded window per HCI spec)
         val scanner = adapter.bluetoothLeScanner
         if (scanner == null) {
             _linkWarningMessage.value = "BLE Scanner unavailable. Check Bluetooth state."
@@ -268,15 +567,15 @@ class IqubeBleManager(
         scanJob?.cancel()
         scanJob = scope.launch {
             try {
-                scanner.startScan(null, scanSettings, bleScanCallback)
+                scanner.startScan(emptyList<ScanFilter>(), scanSettings, bleScanCallback)
                 delay(15_000L)
                 if (_connectionPhase.value == BleConnectionPhase.SCANNING) {
                     scanner.stopScan(bleScanCallback)
                     _linkWarningMessage.value =
-                        "No TVS iQube (`${IqubeBleSpec.TARGET_MAC_ADDRESS}`) found in range. Use 'Replay btsnooz_hci.log' to inspect captured scooter frames."
+                        "No TVS iQube (`${IqubeBleSpec.ADVERTISED_BLE_NAME}` / `${IqubeBleSpec.TARGET_MAC_ADDRESS}`) found in range. Tap 'Ride Replay' or 'Charge Replay' to inspect captured scooter frames."
                     _connectionPhase.value = BleConnectionPhase.DISCONNECTED
                 }
-            } catch (e: SecurityException) {
+            } catch (_: SecurityException) {
                 _linkWarningMessage.value = "Bluetooth scan permission required."
                 _connectionPhase.value = BleConnectionPhase.DISCONNECTED
             } catch (e: Exception) {
@@ -295,7 +594,7 @@ class IqubeBleManager(
             val serviceUuids = result.scanRecord?.serviceUuids?.map { it.uuid.toString().lowercase() }.orEmpty()
 
             val matchesTarget = mac.equals(IqubeBleSpec.TARGET_MAC_ADDRESS, ignoreCase = true) ||
-                name.contains("TVS", ignoreCase = true) ||
+                name.startsWith(IqubeBleSpec.NAME_FILTER_PREFIX, ignoreCase = true) ||
                 name.contains("iQube", ignoreCase = true) ||
                 serviceUuids.contains(IqubeBleSpec.SERVICE_UUID_SMARTXONNECT.lowercase())
 
@@ -315,7 +614,7 @@ class IqubeBleManager(
     private fun connectToGattDevice(device: BluetoothDevice) {
         closeGattCleanly()
         _connectedDeviceMac.value = device.address ?: IqubeBleSpec.TARGET_MAC_ADDRESS
-        _connectedDeviceName.value = device.name ?: IqubeBleSpec.DEFAULT_DEVICE_ALIAS
+        _connectedDeviceName.value = device.name ?: IqubeBleSpec.ADVERTISED_BLE_NAME
         _connectionPhase.value = BleConnectionPhase.CONNECTING_GATT
 
         activeGatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
@@ -336,12 +635,12 @@ class IqubeBleManager(
                 gatt.readRemoteRssi()
                 gatt.discoverServices()
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                val isSupervisionTimeout = (status == 0x08) // BLE HCI Connection Timeout (0x08)
+                val isSupervisionTimeout = (status == 0x08)
                 handleHardwareDisconnect(
                     reason = if (isSupervisionTimeout) {
-                        "Disconnected: Link Supervision Timeout (0x08)"
+                        "Timeout 0x08 (Supervision Timeout)"
                     } else {
-                        "Disconnected (GATT status 0x${Integer.toHexString(status)})"
+                        "GATT Disconnect (0x${Integer.toHexString(status)})"
                     }
                 )
             }
@@ -354,8 +653,6 @@ class IqubeBleManager(
                 return
             }
 
-            // Locate Service 3 either by known UUID or Dynamic Service 3 matching (128-bit service
-            // containing Notify char with 0x2902 CCCD + Write char with 0x2901 CUD)
             var foundNotify: BluetoothGattCharacteristic? = null
             var foundWrite: BluetoothGattCharacteristic? = null
 
@@ -367,16 +664,17 @@ class IqubeBleManager(
                 foundWrite = primaryService.getCharacteristic(UUID.fromString(IqubeBleSpec.CHAR_UUID_COMMAND_WRITE))
             }
 
-            // Dynamic Service 3 Fallback Discovery
             if (foundNotify == null || foundWrite == null) {
                 for (service in gatt.services) {
                     val chars = service.characteristics
                     val notifyCandidate = chars.firstOrNull { c ->
-                        (c.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0 &&
-                            c.getDescriptor(UUID.fromString(IqubeBleSpec.DESCRIPTOR_UUID_CCCD)) != null
+                        c.uuid.toString().equals(IqubeBleSpec.CHAR_UUID_TELEMETRY_NOTIFY, ignoreCase = true) ||
+                            ((c.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0 &&
+                                c.getDescriptor(UUID.fromString(IqubeBleSpec.DESCRIPTOR_UUID_CCCD)) != null)
                     }
                     val writeCandidate = chars.firstOrNull { c ->
-                        (c.properties and (BluetoothGattCharacteristic.PROPERTY_WRITE or BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE)) != 0
+                        c.uuid.toString().equals(IqubeBleSpec.CHAR_UUID_COMMAND_WRITE, ignoreCase = true) ||
+                            (c.properties and (BluetoothGattCharacteristic.PROPERTY_WRITE or BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE)) != 0
                     }
                     if (notifyCandidate != null && writeCandidate != null) {
                         foundNotify = notifyCandidate
@@ -395,7 +693,6 @@ class IqubeBleManager(
             notifyCharacteristic = foundNotify
             writeCharacteristic = foundWrite
 
-            // Step 3: Enable Telemetry Notifications (Write 0x0100 to CCCD 0x001F / 0x2902)
             _connectionPhase.value = BleConnectionPhase.ENABLING_CCCD
             gatt.setCharacteristicNotification(foundNotify, true)
             val cccd = foundNotify.getDescriptor(UUID.fromString(IqubeBleSpec.DESCRIPTOR_UUID_CCCD))
@@ -409,7 +706,6 @@ class IqubeBleManager(
                     gatt.writeDescriptor(cccd)
                 }
             } else {
-                // Proceed directly to Step 4 MTU negotiation if CCCD is implicit
                 _connectionPhase.value = BleConnectionPhase.NEGOTIATING_MTU
                 gatt.requestMtu(IqubeBleSpec.REQUESTED_MTU)
             }
@@ -422,7 +718,6 @@ class IqubeBleManager(
             status: Int
         ) {
             if (descriptor.uuid.toString().equals(IqubeBleSpec.DESCRIPTOR_UUID_CCCD, ignoreCase = true)) {
-                // Step 4: Request MTU 517 (negotiates to 247 bytes on TI BLE 4.2 controller)
                 _connectionPhase.value = BleConnectionPhase.NEGOTIATING_MTU
                 gatt.requestMtu(IqubeBleSpec.REQUESTED_MTU)
             }
@@ -430,15 +725,16 @@ class IqubeBleManager(
 
         override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
             _negotiatedMtu.value = if (status == BluetoothGatt.GATT_SUCCESS) mtu else IqubeBleSpec.EXPECTED_NEGOTIATED_MTU
-            // Step 5: Send Initial Handshake `[RU` (`5B 52 55...`) at +1.45s and start sync loop
             _connectionPhase.value = BleConnectionPhase.SENDING_HANDSHAKE
             scope.launch {
+                beginActiveTripRecordingSession()
                 delay(1450L)
                 commandDispatcher.enqueueCommand(
                     label = "Handshake [RU (0x0022)",
                     rawPayload = commandDispatcher.buildInitialHandshakeFrame()
                 )
                 _connectionPhase.value = BleConnectionPhase.STREAMING_ACTIVE
+                dumpLocationToClusterNow()
                 startPeriodicSyncAndWatchdog()
             }
         }
@@ -483,101 +779,220 @@ class IqubeBleManager(
     }
 
     /**
-     * Built-in Replay Mode pre-populated with the real `btsnooz_hci.log` telemetry bursts
-     * (`11 km/h`, `20 km/h`, `10 km/h`, `52 km/h`, `14 km/h`, `91%` battery `5a 13 5b`,
-     * `5a 7d 54` cluster status, and `5a 11 00` odometer/trip packets).
+     * Built-in Riding Replay Mode (`btsnooz_hci.log`):
+     * Streams the 5 throttle bursts (`11 km/h`, `20 km/h`, `10 km/h`, `52 km/h`, `14 km/h`),
+     * `91%` battery (`5a 13 5b 03 c0 00 ... ff`), `35,925.2 km` hardware odometer (`0x5A 0x10 Bytes 3..5 = 05 7B 54`),
+     * `0.3 km` Trip A & `1.0 km` Trip B (`0x5A 0x11`), and `"TVSiQUBEJI573"` (`0x5A 0x7D`).
      */
     fun startBtsnoozHciLogReplay() {
         disconnectBle(userInitiated = true)
         packetParser.resetIntegratedSubMeterTrip()
+        startGpsTelemetryFusion()
 
         scope.launch {
-            // Simulate realistic 6-step handshake progression
-            _connectedDeviceName.value = "${IqubeBleSpec.DEFAULT_DEVICE_ALIAS} (HCI Log)"
+            _connectedDeviceName.value = IqubeBleSpec.CLUSTER_VEHICLE_ID_DEFAULT
             _connectedDeviceMac.value = IqubeBleSpec.TARGET_MAC_ADDRESS
             _rssiDbm.value = -58
             _isLinkDegraded.value = false
             _linkWarningMessage.value = null
+            replayOdoTenths = HciLogReplayDataset.CHARGING_CAPTURE_ODO_TENTHS_KM // 359252 = 35,925.2 km
+            replayTripATenths = HciLogReplayDataset.CHARGING_CAPTURE_TRIP_A_TENTHS_KM // 3 = 0.3 km
+            replayTripBTenths = HciLogReplayDataset.CHARGING_CAPTURE_TRIP_B_TENTHS_KM // 10 = 1.0 km
+            replayBatterySoc = 91
+            replayClusterRangeTenths = 960 // 96.0 km
+            replayCharging = false
 
             _connectionPhase.value = BleConnectionPhase.ENABLING_CCCD
-            delay(180L)
+            delay(120L)
             _connectionPhase.value = BleConnectionPhase.NEGOTIATING_MTU
-            _negotiatedMtu.value = IqubeBleSpec.EXPECTED_NEGOTIATED_MTU // 247 bytes
-            delay(180L)
+            _negotiatedMtu.value = IqubeBleSpec.EXPECTED_NEGOTIATED_MTU
+            delay(120L)
             _connectionPhase.value = BleConnectionPhase.SENDING_HANDSHAKE
 
-            // Enqueue Initial Handshake `[RU` (`5b 52 55...`) through the real FIFO dispatcher
             commandDispatcher.enqueueCommand(
-                label = "Handshake [RU (#88)",
+                label = "Handshake [RU (0x0022)",
                 rawPayload = commandDispatcher.buildInitialHandshakeFrame()
             )
-            delay(200L)
-            _connectionPhase.value = BleConnectionPhase.REPLAYING_HCI_LOG
+            delay(140L)
+            _connectionPhase.value = BleConnectionPhase.REPLAYING_RIDING_LOG
 
+            // Emit initial unfiltered 20-byte frames
+            feedFrameToParser(HciLogReplayDataset.buildSpeedOdometerFrame0x10(0, replayOdoTenths))
+            feedFrameToParser(HciLogReplayDataset.buildBatteryRangeFrame0x13(replayBatterySoc, replayClusterRangeTenths, false))
+            feedFrameToParser(HciLogReplayDataset.buildVehicleIdentityFrame0x7D())
+            feedFrameToParser(
+                HciLogReplayDataset.buildTripsAndChargingFrame0x11(
+                    tripATenthsKm = replayTripATenths,
+                    tripBTenthsKm = replayTripBTenths,
+                    isChargingActive = false,
+                    socMirrorPercent = replayBatterySoc
+                )
+            )
+            beginActiveTripRecordingSession()
+            dumpLocationToClusterNow()
             startPeriodicSyncAndWatchdog()
 
-            // Feed the real binary frames at captured intervals (~210ms for 0x10, ~320ms for 0x13/0x7D, 2.02s for 0x11)
             replayJob?.cancel()
             replayJob = scope.launch {
                 var tick = 0
-                var prevSpeed = 0
                 val profile = HciLogReplayDataset.CAPTURED_SPEED_PROFILE_KMH
 
-                // Emit initial 0x13, 0x7D, and 0x11 frames immediately
-                feedFrameToParser(HciLogReplayDataset.buildBatteryFrame0x13(isCharging = replayCharging))
-                feedFrameToParser(HciLogReplayDataset.buildClusterStatusFrame0x7D(0, false, replayLampOn))
-                feedFrameToParser(
-                    HciLogReplayDataset.buildOdometerFrame0x11(
-                        odometerTenthsKm = replayOdoTenths,
-                        tripATenthsKm = replayTripATenths,
-                        tripBTenthsKm = replayTripBTenths
-                    )
-                )
-
-                while (isActive && _connectionPhase.value == BleConnectionPhase.REPLAYING_HCI_LOG) {
+                while (isActive && _connectionPhase.value == BleConnectionPhase.REPLAYING_RIDING_LOG) {
                     val speed = profile[tick % profile.size]
-                    val isRegen = speed < prevSpeed && speed > 0
+                    val addedTenths = min(10, tick / 8)
 
-                    // 1. 0x5A 0x10 Speed & Throttle (~4.7 Hz = 212 ms)
-                    val speedFrame = HciLogReplayDataset.buildSpeedFrame0x10(speed, prevSpeed)
-                    feedFrameToParser(speedFrame)
-                    prevSpeed = speed
+                    // 1. 0x5A 0x10 Speed + uint24 BE Total Odometer (4.7 Hz = 212 ms)
+                    feedFrameToParser(
+                        HciLogReplayDataset.buildSpeedOdometerFrame0x10(
+                            speedKmh = speed,
+                            totalOdometerTenthsKm = replayOdoTenths + addedTenths
+                        )
+                    )
 
-                    // 2. 0x5A 0x13 Battery & Range + 0x5A 0x7D Cluster Status (~3.1 Hz)
+                    // 2. 0x5A 0x13 Battery SoC + Cluster Range + 0x5A 0x7D Vehicle ID (3.1 Hz)
                     if (tick % 2 == 0) {
-                        val voltageDeci = 512 - (speed / 12) // Realistic load sag under throttle
+                        if (tick >= 45 && replayBatterySoc == 91) {
+                            replayBatterySoc = 90
+                            replayClusterRangeTenths = 950
+                        }
                         feedFrameToParser(
-                            HciLogReplayDataset.buildBatteryFrame0x13(
-                                socPercent = 91,
-                                rangeEcoKm = 96,
-                                packDecivolts = voltageDeci,
-                                isCharging = replayCharging
+                            HciLogReplayDataset.buildBatteryRangeFrame0x13(
+                                socPercent = replayBatterySoc,
+                                clusterRangeTenthsKm = replayClusterRangeTenths,
+                                isCharging = false
                             )
                         )
-                        feedFrameToParser(
-                            HciLogReplayDataset.buildClusterStatusFrame0x7D(
-                                speedKmh = speed,
-                                isRegen = isRegen,
-                                isLampOn = replayLampOn
-                            )
-                        )
+                        feedFrameToParser(HciLogReplayDataset.buildVehicleIdentityFrame0x7D())
                     }
 
-                    // 3. 0x5A 0x11 Odometer & Trips (0.5 Hz = every ~2.02s / 10 ticks)
+                    // 3. 0x5A 0x11 Trip A, Trip B & Charging Active Flag (0.5 Hz = ~2.02s)
                     if (tick % 10 == 0 && tick > 0) {
-                        val addedTenths = (packetParser.telemetryState.value.integratedDistanceMeters / 100.0).toInt()
                         feedFrameToParser(
-                            HciLogReplayDataset.buildOdometerFrame0x11(
-                                odometerTenthsKm = replayOdoTenths + addedTenths,
+                            HciLogReplayDataset.buildTripsAndChargingFrame0x11(
                                 tripATenthsKm = replayTripATenths + addedTenths,
-                                tripBTenthsKm = replayTripBTenths + addedTenths
+                                tripBTenthsKm = replayTripBTenths + addedTenths,
+                                isChargingActive = false,
+                                socMirrorPercent = replayBatterySoc
                             )
                         )
                     }
 
-                    // Slight RSSI variation (-56 to -63 dBm)
                     _rssiDbm.value = -58 - (tick % 5)
+                    tick++
+                    delay(212L)
+                }
+            }
+        }
+    }
 
+    /**
+     * Built-in Charging Capture Replay Mode (`btsnoop_hci.log`):
+     * Streams the unfiltered charging capture (`38% -> 42%` SoC, `40.0 -> 45.0 km` cluster range,
+     * `0x5A 0x13 Byte 5 = 0x06`, `0x5A 0x11 Byte 5 = 0x01`, `0x5A 0x10` odometer `35,925.2 km`,
+     * and `"TVSiQUBEJI573"` in `0x5A 0x7D`).
+     * First starts in Tier 1/2 Baseline (`123.75s/%` = `2h 45m` for `0-80%`), and then steps `+1%`
+     * with the verified `115.7s` step timing so the UI transitions to Tier 3 Live `1%` Step Timing!
+     */
+    fun startChargingCaptureReplay() {
+        disconnectBle(userInitiated = true)
+        packetParser.resetIntegratedSubMeterTrip()
+        startGpsTelemetryFusion()
+
+        scope.launch {
+            _connectedDeviceName.value = IqubeBleSpec.CLUSTER_VEHICLE_ID_DEFAULT
+            _connectedDeviceMac.value = IqubeBleSpec.TARGET_MAC_ADDRESS
+            _rssiDbm.value = -54
+            _isLinkDegraded.value = false
+            _linkWarningMessage.value = null
+
+            val steps = HciLogReplayDataset.CHARGING_CAPTURE_STEPS
+            var stepIndex = 0
+            replayOdoTenths = HciLogReplayDataset.CHARGING_CAPTURE_ODO_TENTHS_KM // 359252 = 35,925.2 km
+            replayTripATenths = HciLogReplayDataset.CHARGING_CAPTURE_TRIP_A_TENTHS_KM // 0.3 km
+            replayTripBTenths = HciLogReplayDataset.CHARGING_CAPTURE_TRIP_B_TENTHS_KM // 1.0 km
+            replayBatterySoc = steps[0].socPercent // 38%
+            replayClusterRangeTenths = steps[0].clusterRangeTenthsKm // 400 = 40.0 km
+            replayCharging = true
+
+            chargingSessionStartMs = System.currentTimeMillis()
+            _chargingSessionStartSoc.value = replayBatterySoc
+            lastChargingSocValue = replayBatterySoc
+            lastChargingSocStepTimestampMs = System.currentTimeMillis()
+            firstChargingTickSeen = false
+            _liveChargingStepDurationsSec.value = emptyList()
+
+            _connectionPhase.value = BleConnectionPhase.ENABLING_CCCD
+            delay(100L)
+            _connectionPhase.value = BleConnectionPhase.NEGOTIATING_MTU
+            _negotiatedMtu.value = IqubeBleSpec.EXPECTED_NEGOTIATED_MTU
+            delay(100L)
+            _connectionPhase.value = BleConnectionPhase.SENDING_HANDSHAKE
+
+            commandDispatcher.enqueueCommand(
+                label = "Handshake [RU (0x0022)",
+                rawPayload = commandDispatcher.buildInitialHandshakeFrame()
+            )
+            delay(120L)
+            _connectionPhase.value = BleConnectionPhase.REPLAYING_CHARGING_LOG
+
+            // Initial unfiltered charging packets at 38% SoC (40.0 km cluster range)
+            feedFrameToParser(HciLogReplayDataset.buildSpeedOdometerFrame0x10(0, replayOdoTenths))
+            feedFrameToParser(HciLogReplayDataset.buildBatteryRangeFrame0x13(replayBatterySoc, replayClusterRangeTenths, true))
+            feedFrameToParser(HciLogReplayDataset.buildVehicleIdentityFrame0x7D())
+            feedFrameToParser(
+                HciLogReplayDataset.buildTripsAndChargingFrame0x11(
+                    tripATenthsKm = replayTripATenths,
+                    tripBTenthsKm = replayTripBTenths,
+                    isChargingActive = true,
+                    socMirrorPercent = replayBatterySoc
+                )
+            )
+            dumpLocationToClusterNow()
+            startPeriodicSyncAndWatchdog()
+
+            replayJob?.cancel()
+            replayJob = scope.launch {
+                var tick = 0
+                while (isActive && _connectionPhase.value == BleConnectionPhase.REPLAYING_CHARGING_LOG) {
+                    // Advance +1% SoC every ~22 ticks (~4.6s in accelerated replay) and record the verified 115.7s step duration
+                    if (tick > 0 && tick % 22 == 0 && stepIndex < steps.size - 1) {
+                        stepIndex++
+                        val nextStep = steps[stepIndex]
+                        replayBatterySoc = nextStep.socPercent
+                        replayClusterRangeTenths = nextStep.clusterRangeTenthsKm
+                        nextStep.measuredStepDurationSec?.let { measuredSec ->
+                            _liveChargingStepDurationsSec.update { (it + measuredSec).takeLast(10) }
+                        }
+                    }
+
+                    // 1. 0x5A 0x10 Speed = 0 km/h, Odometer = 35,925.2 km (05 7B 54)
+                    feedFrameToParser(HciLogReplayDataset.buildSpeedOdometerFrame0x10(0, replayOdoTenths))
+
+                    // 2. 0x5A 0x13 Battery SoC (38..42%) + Cluster Range (40.0..45.0 km) + Byte 5 = 0x06
+                    if (tick % 2 == 0) {
+                        feedFrameToParser(
+                            HciLogReplayDataset.buildBatteryRangeFrame0x13(
+                                socPercent = replayBatterySoc,
+                                clusterRangeTenthsKm = replayClusterRangeTenths,
+                                isCharging = true
+                            )
+                        )
+                        feedFrameToParser(HciLogReplayDataset.buildVehicleIdentityFrame0x7D())
+                    }
+
+                    // 3. 0x5A 0x11 Trip A (0.3 km), Byte 5 = 0x01 (Charging), Byte 6 = SoC Mirror, Trip B (1.0 km)
+                    if (tick % 8 == 0) {
+                        feedFrameToParser(
+                            HciLogReplayDataset.buildTripsAndChargingFrame0x11(
+                                tripATenthsKm = replayTripATenths,
+                                tripBTenthsKm = replayTripBTenths,
+                                isChargingActive = true,
+                                socMirrorPercent = replayBatterySoc
+                            )
+                        )
+                    }
+
+                    _rssiDbm.value = -54 - (tick % 4)
                     tick++
                     delay(212L)
                 }
@@ -588,7 +1003,6 @@ class IqubeBleManager(
     private fun feedFrameToParser(frame20B: ByteArray) {
         val now = System.currentTimeMillis()
         if (_fragmentedSliceTestEnabled.value && frame20B.size == 20) {
-            // Split 20-byte frame into 2 fragmented ATT slices (8B + 12B) to exercise buffer reassembly
             val slice1 = frame20B.copyOfRange(0, 8)
             val slice2 = frame20B.copyOfRange(8, 20)
             packetParser.ingestRawChunk(slice1, now)
@@ -599,7 +1013,8 @@ class IqubeBleManager(
     }
 
     /**
-     * Starts the periodic `[JD` rider heartbeat (`1.8s`) and the `2,500 ms` Link Watchdog.
+     * Starts the periodic `[JD` clock sync heartbeat (`1.8s`), the automatic `0x5B 0x5C` Location Sync
+     * loop (`10s`), and the `2,500 ms` Link Watchdog.
      */
     @SuppressLint("MissingPermission")
     private fun startPeriodicSyncAndWatchdog() {
@@ -607,16 +1022,13 @@ class IqubeBleManager(
         heartbeatJob = scope.launch {
             while (isActive) {
                 delay(IqubeBleSpec.HEARTBEAT_INTERVAL_MS)
-                val phase = _connectionPhase.value
-                val isConnectedOrReplay =
-                    phase == BleConnectionPhase.STREAMING_ACTIVE || phase == BleConnectionPhase.REPLAYING_HCI_LOG
-                if (isConnectedOrReplay && _heartbeatEnabled.value && !_isLinkDegraded.value) {
+                if (isActivelyConnectedOrReplaying() && _heartbeatEnabled.value && !_isLinkDegraded.value) {
                     commandDispatcher.enqueueCommand(
-                        label = "Heartbeat [JD (1.8s)",
+                        label = "Clock Heartbeat [JD (1.8s)",
                         rawPayload = commandDispatcher.buildHeartbeatSyncFrame()
                     )
                 }
-                if (phase == BleConnectionPhase.STREAMING_ACTIVE) {
+                if (_connectionPhase.value == BleConnectionPhase.STREAMING_ACTIVE) {
                     try {
                         activeGatt?.readRemoteRssi()
                     } catch (_: Exception) {
@@ -625,12 +1037,24 @@ class IqubeBleManager(
             }
         }
 
+        locationSyncJob?.cancel()
+        locationSyncJob = scope.launch {
+            while (isActive) {
+                delay(IqubeBleSpec.LOCATION_SYNC_INTERVAL_MS)
+                // Pause automatic GPS location dumps while an incoming call is ringing on the cluster
+                if (isActivelyConnectedOrReplaying() && _autoLocationSyncEnabled.value &&
+                    !_incomingCallState.value.isRinging && !_isLinkDegraded.value
+                ) {
+                    dumpLocationToClusterNow()
+                }
+            }
+        }
+
         watchdogJob?.cancel()
         watchdogJob = scope.launch {
             while (isActive) {
                 delay(500L)
-                val phase = _connectionPhase.value
-                if (phase == BleConnectionPhase.STREAMING_ACTIVE || phase == BleConnectionPhase.REPLAYING_HCI_LOG) {
+                if (isActivelyConnectedOrReplaying()) {
                     val lastRx = packetParser.telemetryState.value.lastPacketTimestampMs
                     if (lastRx != null) {
                         val silenceMs = System.currentTimeMillis() - lastRx
@@ -654,35 +1078,33 @@ class IqubeBleManager(
     @SuppressLint("MissingPermission")
     private suspend fun performHardwareOrReplayWrite(payload: ByteArray): Boolean {
         val phase = _connectionPhase.value
-        if (phase == BleConnectionPhase.REPLAYING_HCI_LOG) {
-            // Simulate TI BLE 4.2 controller ATT Write Response (0x13) after 30ms connection interval
+        if (phase == BleConnectionPhase.REPLAYING_RIDING_LOG || phase == BleConnectionPhase.REPLAYING_CHARGING_LOG) {
             scope.launch {
-                delay(30L)
-                // Handle side effects of Trip Cycle / Trip Reset / Lamp Toggle in Replay mode
+                delay(28L)
+                val cfg = _tripSubcommandConfig.value
                 if (payload.size == 20 && payload[0] == IqubeBleSpec.HEADER_TELEMETRY && payload[1] == 0xF1.toByte()) {
-                    when (payload[3].toInt() and 0xFF) {
-                        0x01 -> { // Cycle Trip A / Trip B
-                            val nextTab = (packetParser.telemetryState.value.activeTripTab + 1) % 4
-                            packetParser.setActiveTripTab(nextTab)
+                    val subCmd = payload[3].toInt() and 0xFF
+                    when (subCmd) {
+                        cfg.switchTripAByte -> {
+                            packetParser.setActiveTripTab(0)
                         }
-                        0x02 -> { // Reset Active Trip
-                            replayTripATenths = 0
+                        cfg.switchTripBByte -> {
+                            packetParser.setActiveTripTab(1)
+                        }
+                        cfg.resetActiveTripByte -> {
+                            val currentTab = packetParser.telemetryState.value.activeTripTab
+                            if (currentTab == 1) {
+                                replayTripBTenths = 0
+                            } else {
+                                replayTripATenths = 0
+                            }
                             packetParser.resetIntegratedSubMeterTrip()
                             feedFrameToParser(
-                                HciLogReplayDataset.buildOdometerFrame0x11(
-                                    odometerTenthsKm = replayOdoTenths,
-                                    tripATenthsKm = 0,
-                                    tripBTenthsKm = replayTripBTenths
-                                )
-                            )
-                        }
-                        0x03 -> { // Toggle Dashboard Lamp
-                            replayLampOn = !replayLampOn
-                            feedFrameToParser(
-                                HciLogReplayDataset.buildClusterStatusFrame0x7D(
-                                    speedKmh = packetParser.telemetryState.value.speedKmh ?: 0,
-                                    isRegen = false,
-                                    isLampOn = replayLampOn
+                                HciLogReplayDataset.buildTripsAndChargingFrame0x11(
+                                    tripATenthsKm = replayTripATenths,
+                                    tripBTenthsKm = replayTripBTenths,
+                                    isChargingActive = replayCharging,
+                                    socMirrorPercent = replayBatterySoc
                                 )
                             )
                         }
@@ -716,45 +1138,57 @@ class IqubeBleManager(
         }
     }
 
-    // High-level Safe User Command Triggers (Guarded behind explicit user actions)
-    fun sendCycleTripCommand() {
+    /**
+     * Button 1: Switch to Trip A (`[0x5A, 0xF1, 0x00, subCmdA, 0, ..., 0, 0xFF]`).
+     */
+    fun sendSwitchToTripACommand() {
+        val subCmd = _tripSubcommandConfig.value.switchTripAByte.toByte()
+        packetParser.setActiveTripTab(0)
         commandDispatcher.enqueueCommand(
-            label = "Cycle Trip A/B (5A F1 00 01)",
-            rawPayload = commandDispatcher.buildTripControlFrame(0x01)
+            label = String.format("Switch to Trip A (5A F1 00 %02X … FF)", subCmd.toInt() and 0xFF),
+            rawPayload = commandDispatcher.buildTripControlFrame(subCmd)
         )
     }
 
-    fun sendResetTripCommand() {
+    /**
+     * Button 2: Switch to Trip B (`[0x5A, 0xF1, 0x00, subCmdB, 0, ..., 0, 0xFF]`).
+     */
+    fun sendSwitchToTripBCommand() {
+        val subCmd = _tripSubcommandConfig.value.switchTripBByte.toByte()
+        packetParser.setActiveTripTab(1)
         commandDispatcher.enqueueCommand(
-            label = "Reset Active Trip (5A F1 00 02)",
-            rawPayload = commandDispatcher.buildTripControlFrame(0x02)
+            label = String.format("Switch to Trip B (5A F1 00 %02X … FF)", subCmd.toInt() and 0xFF),
+            rawPayload = commandDispatcher.buildTripControlFrame(subCmd)
         )
     }
 
-    fun sendToggleDashboardLampCommand() {
+    /**
+     * Button 3: Reset Active Trip (A/B) (`[0x5A, 0xF1, 0x00, subCmdReset, 0, ..., 0, 0xFF]`).
+     */
+    fun sendResetActiveTripCommand() {
+        val subCmd = _tripSubcommandConfig.value.resetActiveTripByte.toByte()
         commandDispatcher.enqueueCommand(
-            label = "Toggle Cluster Lamp (5A F1 00 03)",
-            rawPayload = commandDispatcher.buildTripControlFrame(0x03)
+            label = String.format("Reset Active Trip A/B (5A F1 00 %02X … FF)", subCmd.toInt() and 0xFF),
+            rawPayload = commandDispatcher.buildTripControlFrame(subCmd)
         )
     }
 
-    fun sendNavigationInstruction(
-        turnIcon: NavigationTurnIcon,
-        distanceMeters: Int,
-        roadName: String,
-        use5AEnvelope: Boolean = false
-    ) {
-        val prefixLabel = if (use5AEnvelope) "5A 57" else "5B 5C 57 ([\\W)"
+    /**
+     * Builds and enqueues the 20-byte Location Display Packet (`[0x5B, 0x5C, ...17B ASCII, 0xFF]`)
+     * to Handle 0x0022 (`0x5352`).
+     */
+    fun dumpLocationToClusterNow(explicitLocationText: String? = null) {
+        val maxLen = IqubeBleSpec.MAX_LOCATION_ASCII_BYTES
+        val effectiveLocation = when {
+            !explicitLocationText.isNullOrBlank() -> explicitLocationText.trim().take(maxLen)
+            _customLocationOverride.value.isNotBlank() -> _customLocationOverride.value.trim().take(maxLen)
+            else -> _detectedLocalityName.value.trim().take(maxLen).ifEmpty { "Sonegaon" }
+        }
+        _lastSyncedClusterLocation.value = effectiveLocation
+        val payload = commandDispatcher.buildClusterLocationPacket(effectiveLocation)
         commandDispatcher.enqueueCommand(
-            label = "Nav $prefixLabel: ${turnIcon.label} (${distanceMeters}m)",
-            rawPayload = commandDispatcher.buildNavigationFrame(turnIcon, distanceMeters, roadName, use5AEnvelope)
-        )
-    }
-
-    fun sendCallerOrAlertBanner(alertType: ClusterAlertType, callerText: String) {
-        commandDispatcher.enqueueCommand(
-            label = "Alert []C: ${alertType.label} ($callerText)",
-            rawPayload = commandDispatcher.buildCallerAlertFrame(alertType, callerText)
+            label = "Cluster Location [\\$effectiveLocation (0xFF)",
+            rawPayload = payload
         )
     }
 
@@ -762,8 +1196,123 @@ class IqubeBleManager(
         return commandDispatcher.enqueueCommand(label, payload).map { }
     }
 
+    private fun beginActiveTripRecordingSession() {
+        val tele = packetParser.telemetryState.value
+        val loc = _lastKnownLocation.value
+        val lat = loc?.latitude ?: 21.0922
+        val lon = loc?.longitude ?: 79.0560
+        val locality = _detectedLocalityName.value.ifBlank { "Sonegaon" }
+
+        _activeTripSession.value = ActiveTripSession(
+            startTimeMs = System.currentTimeMillis(),
+            startLocationName = locality,
+            startLatitude = lat,
+            startLongitude = lon,
+            startOdometerKm = tele.odometerKm,
+            startBatteryPct = tele.batteryPercent
+        )
+    }
+
+    private fun finalizeSessionOnDisconnect(disconnectReason: String) {
+        val now = System.currentTimeMillis()
+        val tele = packetParser.telemetryState.value
+
+        // 1. Finalize Charging Session if charging occurred with >= 1% gain
+        val startChgMs = chargingSessionStartMs
+        val startChgSoc = _chargingSessionStartSoc.value
+        val endChgSoc = tele.batteryPercent
+        if (startChgMs != null && startChgSoc != null && endChgSoc != null && endChgSoc > startChgSoc) {
+            val pctGained = endChgSoc - startChgSoc
+            val liveSteps = _liveChargingStepDurationsSec.value
+            val avgSecPerPct = if (liveSteps.isNotEmpty()) {
+                liveSteps.average()
+            } else {
+                max(60.0, ((now - startChgMs) / 1000.0) / pctGained.toDouble())
+            }
+            val durationSec = (pctGained * avgSecPerPct).toLong().coerceAtLeast(60L)
+            tripRepository.saveChargingSession(
+                SavedChargingSession(
+                    id = "chg_$now",
+                    startTimeMs = startChgMs,
+                    endTimeMs = now,
+                    startPct = startChgSoc,
+                    endPct = endChgSoc,
+                    pctGained = pctGained,
+                    durationSeconds = durationSec,
+                    avgSecondsPerPct = (avgSecPerPct * 10.0).roundToInt() / 10.0
+                )
+            )
+        }
+        chargingSessionStartMs = null
+        _chargingSessionStartSoc.value = null
+        lastChargingSocValue = null
+        lastChargingSocStepTimestampMs = null
+        firstChargingTickSeen = false
+        _liveChargingStepDurationsSec.value = emptyList()
+
+        // 2. Finalize Riding Trip Session
+        val session = _activeTripSession.value ?: return
+        _activeTripSession.value = null
+
+        val durationSec = max(1L, (now - session.startTimeMs) / 1000L)
+        val loc = _lastKnownLocation.value
+        val endLat = loc?.latitude ?: session.startLatitude
+        val endLon = loc?.longitude ?: session.startLongitude
+        val endLocationName = _detectedLocalityName.value.ifBlank { session.startLocationName }
+
+        val startOdo = session.startOdometerKm ?: tele.odometerKm ?: 35925.2
+        val endOdo = tele.odometerKm ?: startOdo
+        val odoDeltaKm = max(0.0, endOdo - startOdo)
+        val subMeterKm = tele.integratedDistanceMeters / 1000.0
+        val distanceKm = ((max(subMeterKm, odoDeltaKm)) * 100.0).roundToInt() / 100.0
+
+        val startSoc = session.startBatteryPct ?: tele.batteryPercent ?: 91
+        val endSoc = tele.batteryPercent ?: startSoc
+        val batteryUsed = max(0, startSoc - endSoc)
+
+        val avgSpeed = if (session.speedSamplesCount > 0) {
+            ((session.speedSamplesSum.toDouble() / session.speedSamplesCount) * 10.0).roundToInt() / 10.0
+        } else 0.0
+
+        val efficiency = if (batteryUsed >= 1 && distanceKm > 0.0) {
+            ((distanceKm / batteryUsed.toDouble()) * 100.0).roundToInt() / 100.0
+        } else if (session.dominantRideMode == RideMode.POWER) {
+            IqubeBleSpec.DEFAULT_POWER_KM_PER_PCT
+        } else {
+            IqubeBleSpec.DEFAULT_ECO_KM_PER_PCT
+        }
+
+        if (!tele.isCharging && (distanceKm > 0.0 || (tele.speedKmh ?: 0) > 0)) {
+            val savedRecord = SavedTripRecord(
+                id = "trip_$now",
+                startTimeMs = session.startTimeMs,
+                endTimeMs = now,
+                durationSeconds = durationSec,
+                startLocationName = session.startLocationName,
+                startLatitude = session.startLatitude,
+                startLongitude = session.startLongitude,
+                endLocationName = endLocationName,
+                endLatitude = endLat,
+                endLongitude = endLon,
+                distanceKm = distanceKm,
+                startOdometerKm = (startOdo * 10.0).roundToInt() / 10.0,
+                endOdometerKm = (endOdo * 10.0).roundToInt() / 10.0,
+                startBatteryPct = startSoc,
+                endBatteryPct = endSoc,
+                batteryUsedPct = batteryUsed,
+                peakSpeedKmh = max(session.peakSpeedKmh, tele.peakSpeedKmh),
+                avgSpeedKmh = avgSpeed,
+                rideMode = session.dominantRideMode,
+                efficiencyKmPerPct = efficiency,
+                disconnectReason = disconnectReason
+            )
+            tripRepository.saveCompletedTrip(savedRecord)
+        }
+    }
+
     private fun handleHardwareDisconnect(reason: String) {
         captureLastParkedLocationOnDisconnect()
+        finalizeSessionOnDisconnect(reason)
         closeGattCleanly()
         commandDispatcher.clearPendingQueueOnDisconnect()
         packetParser.clearTelemetryOnDisconnect()
@@ -796,20 +1345,38 @@ class IqubeBleManager(
     private fun captureLastParkedLocationOnDisconnect() {
         val tele = packetParser.telemetryState.value
         val loc = _lastKnownLocation.value
-        val lat = loc?.latitude ?: 12.9716 // Fallback only if GPS hardware fix not yet acquired
-        val lon = loc?.longitude ?: 77.5946
-        val acc = loc?.accuracy ?: 12.0f
+        val lat = loc?.latitude ?: 21.0922
+        val lon = loc?.longitude ?: 79.0560
+        val acc = loc?.accuracy ?: 10.0f
+        val trueEco = trueRangeState.value.trueEcoRangeKm
 
-        if (tele.batteryPercent != null || tele.speedKmh != null) {
+        if (tele.batteryPercent != null || tele.speedKmh != null || tele.odometerKm != null) {
+            val locality = _detectedLocalityName.value.ifBlank { "Sonegaon" }
             _lastParkedLocation.value = LastParkedLocation(
+                locationName = locality,
                 latitude = lat,
                 longitude = lon,
                 accuracyMeters = acc,
                 timestampMs = System.currentTimeMillis(),
                 batteryPercentAtPark = tele.batteryPercent,
-                rangeKmAtPark = tele.rangeEcoKm,
+                rangeKmAtPark = trueEco,
                 odometerKmAtPark = tele.odometerKm
             )
+            if (tele.batteryPercent != null) {
+                tripRepository.saveLastSeenState(
+                    LastSeenScooterState(
+                        timestampMs = System.currentTimeMillis(),
+                        batteryPct = tele.batteryPercent,
+                        odometerKm = tele.odometerKm ?: 35925.2,
+                        clusterRangeKm = tele.clusterRangeKm ?: (tele.batteryPercent * 1.0),
+                        tripAKm = tele.tripAKm ?: 0.3,
+                        tripBKm = tele.tripBKm ?: 1.0,
+                        locationName = locality,
+                        wasCharging = tele.isCharging,
+                        vehicleId = tele.vehicleIdString ?: IqubeBleSpec.CLUSTER_VEHICLE_ID_DEFAULT
+                    )
+                )
+            }
         }
     }
 
@@ -817,6 +1384,7 @@ class IqubeBleManager(
         replayJob?.cancel()
         replayJob = null
         heartbeatJob?.cancel()
+        locationSyncJob?.cancel()
         watchdogJob?.cancel()
     }
 
@@ -826,6 +1394,7 @@ class IqubeBleManager(
             scanJob?.cancel()
         }
         captureLastParkedLocationOnDisconnect()
+        finalizeSessionOnDisconnect(if (userInitiated) "Manual Disconnect" else "BLE Link Lost")
         stopReplayModeIfNeeded()
         closeGattCleanly()
         commandDispatcher.clearPendingQueueOnDisconnect()
@@ -836,9 +1405,6 @@ class IqubeBleManager(
         _connectionPhase.value = BleConnectionPhase.DISCONNECTED
     }
 
-    /**
-     * Prevents Android GATT Error 133 by always disconnecting, closing, and clearing references.
-     */
     @SuppressLint("MissingPermission")
     private fun closeGattCleanly() {
         try {

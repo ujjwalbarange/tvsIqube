@@ -43,7 +43,6 @@ import com.example.model.LastParkedLocation
 import com.example.model.TelemetryState
 import com.example.ui.theme.AmberWarning
 import com.example.ui.theme.ElectricCyan
-import com.example.ui.theme.EnergeticCoral
 import com.example.ui.theme.NeonMint
 import com.example.ui.theme.SlateBorder
 import com.example.ui.theme.SlateCardElevated
@@ -58,6 +57,7 @@ import java.util.Locale
 fun GpsRideLoggerScreen(
     telemetry: TelemetryState,
     currentGpsSpeedKmh: Double?,
+    detectedLocalityName: String,
     lastParkedLocation: LastParkedLocation?,
     gpsFusionSamples: List<GpsBleFusionSample>,
     autoReconnectEnabled: Boolean,
@@ -120,11 +120,16 @@ fun GpsRideLoggerScreen(
                             color = NeonMint
                         )
                     }
+                    Text(
+                        text = "Locality: $detectedLocalityName",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = ElectricCyan
+                    )
                 }
 
                 if (lastParkedLocation == null) {
                     Text(
-                        text = "No parked event recorded in this session yet. When an active BLE connection or HCI Log Replay disconnects, the scooter's coordinates, Battery SoC %, and Range are automatically latched here.",
+                        text = "No parked event recorded in this session yet. When an active BLE connection or HCI Log Replay disconnects, the scooter's reverse-geocoded locality, GPS coordinates, Battery SoC %, and True Range are automatically latched here.",
                         style = MaterialTheme.typography.bodyMedium,
                         color = TextSecondary
                     )
@@ -143,7 +148,7 @@ fun GpsRideLoggerScreen(
                         verticalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
                         Text(
-                            text = "LAT ${String.format(Locale.US, "%.5f", lastParkedLocation.latitude)}  •  LON ${String.format(Locale.US, "%.5f", lastParkedLocation.longitude)}",
+                            text = "${lastParkedLocation.locationName}  •  LAT ${String.format(Locale.US, "%.5f", lastParkedLocation.latitude)}  LON ${String.format(Locale.US, "%.5f", lastParkedLocation.longitude)}",
                             style = MaterialTheme.typography.titleMedium,
                             fontWeight = FontWeight.Bold,
                             color = TextPrimary
@@ -163,12 +168,12 @@ fun GpsRideLoggerScreen(
                                 color = ElectricCyan
                             )
                             Text(
-                                text = "Range: ${lastParkedLocation.rangeKmAtPark?.let { "$it km" } ?: "-- km"}",
+                                text = "True Range: ${lastParkedLocation.rangeKmAtPark?.let { String.format(Locale.US, "%.1f km", it) } ?: "-- km"}",
                                 style = MaterialTheme.typography.labelLarge,
                                 color = NeonMint
                             )
                             Text(
-                                text = "ODO: ${lastParkedLocation.odometerKmAtPark?.let { String.format(Locale.US, "%.1f km", it) } ?: "-- km"}",
+                                text = "ODO: ${lastParkedLocation.odometerKmAtPark?.let { String.format(Locale.US, "%,.1f km", it) } ?: "-- km"}",
                                 style = MaterialTheme.typography.labelLarge,
                                 color = AmberWarning
                             )
@@ -264,7 +269,7 @@ fun GpsRideLoggerScreen(
                     )
                     Spacer(modifier = Modifier.width(8.dp))
                     Text(
-                        text = if (gpsPermissionGranted) "Refresh GPS Telemetry Listener" else "Enable Phone GPS + BLE Speed Fusion",
+                        text = if (gpsPermissionGranted) "Refresh GPS + Nominatim Locality Listener" else "Enable Phone GPS + Nominatim Reverse Geocoding",
                         style = MaterialTheme.typography.labelLarge,
                         fontWeight = FontWeight.Bold
                     )
@@ -336,7 +341,7 @@ fun GpsRideLoggerScreen(
                                 color = TextPrimary
                             )
                             Text(
-                                text = "SoC: ${sample.batteryPercent ?: "--"}% • (${String.format(Locale.US, "%.4f", sample.latitude)}, ${String.format(Locale.US, "%.4f", sample.longitude)})",
+                                text = "${sample.localityName} • SoC: ${sample.batteryPercent ?: "--"}%",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = ElectricCyan
                             )

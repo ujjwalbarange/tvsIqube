@@ -1,5 +1,6 @@
 package com.example.ui.screens
 
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
@@ -30,19 +31,29 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Bolt
-import androidx.compose.material.icons.filled.LightMode
-import androidx.compose.material.icons.filled.Navigation
-import androidx.compose.material.icons.filled.NotificationsActive
+import androidx.compose.material.icons.filled.Call
+import androidx.compose.material.icons.filled.CallEnd
+import androidx.compose.material.icons.filled.History
+import androidx.compose.material.icons.filled.LocationOn
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.SwapHoriz
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -55,9 +66,14 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import com.example.model.ClusterAlertType
-import com.example.model.NavigationTurnIcon
+import com.example.model.ChargingMonitorState
+import com.example.model.IncomingCallRelayState
+import com.example.model.IqubeBleSpec
+import com.example.model.LastSeenScooterState
+import com.example.model.RideMode
 import com.example.model.TelemetryState
+import com.example.model.TripSubcommandConfig
+import com.example.model.TrueRangeCalculation
 import com.example.ui.theme.AmberWarning
 import com.example.ui.theme.ElectricCyan
 import com.example.ui.theme.EnergeticCoral
@@ -68,22 +84,41 @@ import com.example.ui.theme.SlateSurface
 import com.example.ui.theme.TextMuted
 import com.example.ui.theme.TextPrimary
 import com.example.ui.theme.TextSecondary
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
+import kotlin.math.max
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun CockpitDashboardScreen(
     telemetry: TelemetryState,
+    trueRange: TrueRangeCalculation,
+    chargingMonitor: ChargingMonitorState,
+    lastSeenState: LastSeenScooterState?,
+    incomingCallState: IncomingCallRelayState,
+    selectedRangeMode: RideMode,
+    detectedLocalityName: String,
+    customLocationOverride: String,
+    lastSyncedClusterLocation: String?,
+    autoLocationSyncEnabled: Boolean,
+    tripSubcommandConfig: TripSubcommandConfig,
+    onSelectRangeMode: (RideMode) -> Unit,
     onSelectTripTab: (Int) -> Unit,
-    onResetTripClick: () -> Unit,
-    onCycleTripClick: () -> Unit,
-    onPushSampleNavClick: (NavigationTurnIcon, Int, String) -> Unit,
-    onSendSampleCallAlertClick: (ClusterAlertType, String) -> Unit,
-    onToggleLampClick: () -> Unit,
+    onSwitchToTripAClick: () -> Unit,
+    onSwitchToTripBClick: () -> Unit,
+    onResetActiveTripClick: () -> Unit,
+    onDumpLocationToClusterClick: () -> Unit,
+    onCustomLocationOverrideChange: (String) -> Unit,
+    onSetAutoLocationSync: (Boolean) -> Unit,
+    onTriggerIncomingCallClick: (String) -> Unit,
+    onEndIncomingCallClick: () -> Unit,
+    onSimulateChargingStepClick: () -> Unit,
     onToggleChargingClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val scrollState = rememberScrollState()
+    val isOfflineUsingLastSeen = telemetry.batteryPercent == null && lastSeenState != null
 
     Column(
         modifier = modifier
@@ -98,30 +133,77 @@ fun CockpitDashboardScreen(
                 .widthIn(max = 680.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
-            // 1. HERO VISUALIZER: Circular Battery SoC Arc Gauge & Range Card (Opcode 0x13)
-            HeroBatterySocGaugeCard(
+            // 0A. ACTIVE INCOMING CALL BANNER (When Ringing on Cluster 0x5B 0x5C)
+            AnimatedVisibility(visible = incomingCallState.isRinging) {
+                IncomingCallActiveBanner(
+                    incomingCallState = incomingCallState,
+                    onEndCallClick = onEndIncomingCallClick
+                )
+            }
+
+            // 0B. OFFLINE / DISCONNECTED "LAST SEEN" SNAPSHOT BANNER
+            AnimatedVisibility(visible = isOfflineUsingLastSeen && lastSeenState != null) {
+                if (lastSeenState != null) {
+                    OfflineLastSeenSnapshotCard(
+                        lastSeen = lastSeenState,
+                        trueRange = trueRange
+                    )
+                }
+            }
+
+            // 1. HERO VISUALIZER: Circular Battery SoC Arc Gauge + Cluster Range (0x13 Bytes 3..4) + True Range Engine
+            HeroBatteryAndTrueRangeCard(
                 telemetry = telemetry,
+                lastSeenState = lastSeenState,
+                trueRange = trueRange,
+                selectedRangeMode = selectedRangeMode,
+                onSelectRangeMode = onSelectRangeMode,
                 onToggleChargingClick = onToggleChargingClick
             )
 
-            // 2. LIVE TELEMETRY STRIP: Speedometer (0x10), Sprint Timer & Tabbed Trip/Odometer (0x11)
+            // 2. LIVE CHARGING MONITOR VIEW (When 0x11 Byte 5 == 0x01 or 0x13 Byte 5 == 0x06)
+            AnimatedVisibility(visible = telemetry.isCharging) {
+                LiveChargingMonitorCard(
+                    telemetry = telemetry,
+                    chargingMonitor = chargingMonitor,
+                    trueRange = trueRange,
+                    onSimulateChargingStepClick = onSimulateChargingStepClick
+                )
+            }
+
+            // 3. LIVE TELEMETRY STRIP: Speed + Odometer (0x10 Bytes 2..5) & Hardware Trip A / Trip B (0x11)
             LiveTelemetryStripSection(
                 telemetry = telemetry,
+                lastSeenState = lastSeenState,
                 onSelectTripTab = onSelectTripTab
             )
 
-            // 3. INTERACTIVE COMMAND DECK (Write to 0x5352 / Handle 0x0022)
-            InteractiveCommandDeckCard(
-                isLampOn = telemetry.isDashboardLampOn,
-                onResetTripClick = onResetTripClick,
-                onCycleTripClick = onCycleTripClick,
-                onPushSampleNavClick = {
-                    onPushSampleNavClick(NavigationTurnIcon.TURN_RIGHT, 180, "MG ROAD")
-                },
-                onSendSampleCallAlertClick = {
-                    onSendSampleCallAlertClick(ClusterAlertType.INCOMING_CALL, "ARJUN +9198")
-                },
-                onToggleLampClick = onToggleLampClick
+            // 4. VERIFIED TRIP CONTROL DECK (Handle 0x0022: Switch to Trip A, Switch to Trip B, Reset Active Trip A/B)
+            VerifiedTripControlsCard(
+                tripSubcommandConfig = tripSubcommandConfig,
+                onSwitchToTripAClick = onSwitchToTripAClick,
+                onSwitchToTripBClick = onSwitchToTripBClick,
+                onResetActiveTripClick = onResetActiveTripClick
+            )
+
+            // 5. LIVE CLUSTER LOCATION SYNC CARD (0x5B 0x5C + 17B ASCII Locality Name + 0xFF)
+            ClusterLocationSyncCard(
+                detectedLocalityName = detectedLocalityName,
+                customLocationOverride = customLocationOverride,
+                lastSyncedClusterLocation = lastSyncedClusterLocation,
+                autoLocationSyncEnabled = autoLocationSyncEnabled,
+                isCallRinging = incomingCallState.isRinging,
+                onCustomLocationOverrideChange = onCustomLocationOverrideChange,
+                onSetAutoLocationSync = onSetAutoLocationSync,
+                onDumpLocationNowClick = onDumpLocationToClusterClick
+            )
+
+            // 6. INCOMING CALL CLUSTER RELAY (1st Name + Call Symbol on 0x5B 0x5C ... 0xFF)
+            IncomingCallClusterRelayCard(
+                incomingCallState = incomingCallState,
+                detectedLocalityName = detectedLocalityName,
+                onTriggerCall = onTriggerIncomingCallClick,
+                onEndCall = onEndIncomingCallClick
             )
 
             Spacer(modifier = Modifier.height(12.dp))
@@ -130,12 +212,142 @@ fun CockpitDashboardScreen(
 }
 
 @Composable
-private fun HeroBatterySocGaugeCard(
+private fun IncomingCallActiveBanner(
+    incomingCallState: IncomingCallRelayState,
+    onEndCallClick: () -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(16.dp))
+            .background(AmberWarning.copy(alpha = 0.18f))
+            .border(1.5.dp, AmberWarning, RoundedCornerShape(16.dp))
+            .padding(horizontal = 14.dp, vertical = 12.dp)
+            .testTag("incoming_call_active_banner"),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Row(
+            modifier = Modifier.weight(1f),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(
+                imageVector = Icons.Default.Call,
+                contentDescription = "Incoming Call Active",
+                tint = AmberWarning,
+                modifier = Modifier.size(24.dp)
+            )
+            Spacer(modifier = Modifier.width(10.dp))
+            Column {
+                Text(
+                    text = "INCOMING CALL: ${incomingCallState.extractedFirstName.uppercase()}",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = TextPrimary
+                )
+                Text(
+                    text = "Cluster 0x5B 0x5C Locked: \"${incomingCallState.clusterFormattedText}\" + 0xFF (GPS Sync Paused)",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = AmberWarning
+                )
+            }
+        }
+        Spacer(modifier = Modifier.width(8.dp))
+        Button(
+            onClick = onEndCallClick,
+            colors = ButtonDefaults.buttonColors(containerColor = EnergeticCoral, contentColor = SlateSurface),
+            modifier = Modifier.testTag("banner_end_call_button")
+        ) {
+            Icon(Icons.Default.CallEnd, contentDescription = "End Call", modifier = Modifier.size(16.dp))
+            Spacer(modifier = Modifier.width(4.dp))
+            Text("End & Restore GPS", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
+        }
+    }
+}
+
+@Composable
+private fun OfflineLastSeenSnapshotCard(
+    lastSeen: LastSeenScooterState,
+    trueRange: TrueRangeCalculation
+) {
+    val exactTimeStr = remember(lastSeen.timestampMs) {
+        SimpleDateFormat("hh:mm a • dd MMM", Locale.US).format(Date(lastSeen.timestampMs))
+    }
+    val elapsedMinutes = max(0L, (System.currentTimeMillis() - lastSeen.timestampMs) / 60_000L)
+    val relativeStr = when {
+        elapsedMinutes == 0L -> "Just now"
+        elapsedMinutes == 1L -> "1 min ago"
+        elapsedMinutes < 60L -> "$elapsedMinutes mins ago"
+        else -> "${elapsedMinutes / 60L}h ${elapsedMinutes % 60L}m ago"
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(16.dp))
+            .background(SlateCardElevated)
+            .border(1.dp, ElectricCyan.copy(alpha = 0.5f), RoundedCornerShape(16.dp))
+            .padding(14.dp)
+            .testTag("offline_last_seen_card"),
+        verticalArrangement = Arrangement.spacedBy(6.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    imageVector = Icons.Default.History,
+                    contentDescription = "Offline Last Seen Snapshot",
+                    tint = ElectricCyan,
+                    modifier = Modifier.size(16.dp)
+                )
+                Spacer(modifier = Modifier.width(6.dp))
+                Text(
+                    text = "OFFLINE LAST SEEN STATE (${lastSeen.vehicleId})",
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = ElectricCyan
+                )
+            }
+            Text(
+                text = "Last seen $relativeStr ($exactTimeStr)",
+                style = MaterialTheme.typography.labelSmall,
+                color = NeonMint
+            )
+        }
+
+        Text(
+            text = "Location: ${lastSeen.locationName}  •  Last SoC: ${lastSeen.batteryPct}%  •  ODO: ${String.format(Locale.US, "%,.1f km", lastSeen.odometerKm)}  •  Cluster Range: ${String.format(Locale.US, "%.1f km", lastSeen.clusterRangeKm)}",
+            style = MaterialTheme.typography.bodyMedium,
+            color = TextPrimary
+        )
+
+        Text(
+            text = "Expected True Range at ${lastSeen.batteryPct}%: Eco ${trueRange.trueEcoRangeKm?.let { String.format(Locale.US, "%.1f km", it) } ?: "--"}  |  Power ${trueRange.truePowerRangeKm?.let { String.format(Locale.US, "%.1f km", it) } ?: "--"}",
+            style = MaterialTheme.typography.labelMedium,
+            fontWeight = FontWeight.Bold,
+            color = NeonMint
+        )
+    }
+}
+
+@Composable
+private fun HeroBatteryAndTrueRangeCard(
     telemetry: TelemetryState,
+    lastSeenState: LastSeenScooterState?,
+    trueRange: TrueRangeCalculation,
+    selectedRangeMode: RideMode,
+    onSelectRangeMode: (RideMode) -> Unit,
     onToggleChargingClick: () -> Unit
 ) {
-    val soc = telemetry.batteryPercent
-    val targetSweep = if (soc != null) (soc / 100f) * 260f else 0f
+    // Never blank out gauges when disconnected if Last Seen state is persisted
+    val effectiveSoc = telemetry.batteryPercent ?: lastSeenState?.batteryPct
+    val effectiveClusterRangeKm = telemetry.clusterRangeKm ?: lastSeenState?.clusterRangeKm
+    val isLive = telemetry.batteryPercent != null
+
+    val targetSweep = if (effectiveSoc != null) (effectiveSoc / 100f) * 260f else 0f
     val animatedSweep by animateFloatAsState(
         targetValue = targetSweep,
         animationSpec = tween(durationMillis = 450, easing = FastOutSlowInEasing),
@@ -145,7 +357,7 @@ private fun HeroBatterySocGaugeCard(
     val infiniteTransition = rememberInfiniteTransition(label = "charging_pulse")
     val pulseAlpha by infiniteTransition.animateFloat(
         initialValue = 0.25f,
-        targetValue = 0.85f,
+        targetValue = 0.90f,
         animationSpec = infiniteRepeatable(
             animation = tween(900, easing = FastOutSlowInEasing),
             repeatMode = RepeatMode.Reverse
@@ -162,7 +374,7 @@ private fun HeroBatterySocGaugeCard(
                     colors = listOf(SlateCardElevated, SlateSurface)
                 )
             )
-            .border(1.dp, SlateBorder, RoundedCornerShape(20.dp))
+            .border(1.dp, if (telemetry.isCharging) NeonMint.copy(alpha = pulseAlpha) else SlateBorder, RoundedCornerShape(20.dp))
             .padding(18.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
@@ -172,14 +384,14 @@ private fun HeroBatterySocGaugeCard(
             verticalAlignment = Alignment.CenterVertically
         ) {
             Text(
-                text = "BATTERY STATE OF CHARGE (0x5A 0x13)",
+                text = if (isLive) "BATTERY SoC (0x13) & TRUE RANGE" else "LAST SEEN BATTERY SoC & EXPECTED RANGE",
                 style = MaterialTheme.typography.labelMedium,
                 color = TextSecondary
             )
             Row(
                 modifier = Modifier
                     .clip(RoundedCornerShape(12.dp))
-                    .background(if (telemetry.isCharging) NeonMint.copy(alpha = 0.16f) else SlateSurface)
+                    .background(if (telemetry.isCharging) NeonMint.copy(alpha = 0.18f) else SlateSurface)
                     .border(
                         1.dp,
                         if (telemetry.isCharging) NeonMint.copy(alpha = pulseAlpha) else SlateBorder,
@@ -199,11 +411,12 @@ private fun HeroBatterySocGaugeCard(
                 Spacer(modifier = Modifier.width(4.dp))
                 Text(
                     text = if (telemetry.isCharging) {
-                        "CHARGING • ${telemetry.timeToFullMinutes ?: "--"} MIN"
+                        "CHARGING ACTIVE (0x06 / 0x01)"
                     } else {
-                        "DISCHARGING"
+                        "TAP FOR CHARGE REPLAY"
                     },
                     style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.Bold,
                     color = if (telemetry.isCharging) NeonMint else TextSecondary
                 )
             }
@@ -211,9 +424,9 @@ private fun HeroBatterySocGaugeCard(
 
         Spacer(modifier = Modifier.height(10.dp))
 
-        // Circular Arc Gauge + Speed Overlay
+        // Circular Arc Gauge
         Box(
-            modifier = Modifier.size(210.dp),
+            modifier = Modifier.size(205.dp),
             contentAlignment = Alignment.Center
         ) {
             Canvas(modifier = Modifier.fillMaxSize()) {
@@ -222,7 +435,6 @@ private fun HeroBatterySocGaugeCard(
                 val arcSize = Size(size.width - inset * 2, size.height - inset * 2)
                 val topLeft = Offset(inset, inset)
 
-                // Background Track Arc (140 deg to +260 deg)
                 drawArc(
                     color = SlateBorder,
                     startAngle = 140f,
@@ -233,7 +445,6 @@ private fun HeroBatterySocGaugeCard(
                     style = Stroke(width = strokeWidth, cap = StrokeCap.Round)
                 )
 
-                // Active SoC Gradient Arc
                 if (animatedSweep > 0.5f) {
                     val arcBrush = Brush.sweepGradient(
                         colors = listOf(ElectricCyan, NeonMint, ElectricCyan)
@@ -252,98 +463,367 @@ private fun HeroBatterySocGaugeCard(
 
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 Text(
-                    text = soc?.let { "$it %" } ?: "-- %",
+                    text = effectiveSoc?.let { "$it %" } ?: "-- %",
                     style = MaterialTheme.typography.displayMedium,
-                    color = if (soc != null) TextPrimary else TextMuted,
+                    color = if (effectiveSoc != null) TextPrimary else TextMuted,
                     modifier = Modifier.testTag("battery_soc_text")
                 )
                 Spacer(modifier = Modifier.height(2.dp))
+                val displayedTrueRange = if (selectedRangeMode == RideMode.POWER) {
+                    trueRange.truePowerRangeKm
+                } else {
+                    trueRange.trueEcoRangeKm
+                }
                 Text(
-                    text = telemetry.rangeEcoKm?.let { "EST. RANGE: $it KM" } ?: "EST. RANGE: -- KM",
+                    text = displayedTrueRange?.let {
+                        String.format(Locale.US, "TRUE %s: %.1f KM", selectedRangeMode.name, it)
+                    } ?: "TRUE RANGE: --.- KM",
                     style = MaterialTheme.typography.labelLarge,
                     fontWeight = FontWeight.Bold,
-                    color = ElectricCyan,
+                    color = if (selectedRangeMode == RideMode.POWER) EnergeticCoral else NeonMint,
                     modifier = Modifier.testTag("estimated_range_text")
                 )
-                Spacer(modifier = Modifier.height(4.dp))
+                Spacer(modifier = Modifier.height(2.dp))
                 Text(
-                    text = telemetry.rangePowerKm?.let { "POWER MODE: ~$it KM" } ?: "POWER MODE: -- KM",
+                    text = effectiveClusterRangeKm?.let {
+                        String.format(Locale.US, "CLUSTER (0x13 B3..4): %.1f KM", it)
+                    } ?: "CLUSTER (0x13): --.- KM",
                     style = MaterialTheme.typography.labelSmall,
-                    color = TextSecondary
+                    color = ElectricCyan
                 )
             }
         }
 
         Spacer(modifier = Modifier.height(8.dp))
 
-        // Pack Voltage, Efficiency & Regen Strip
+        // True Range Eco vs. Power Mode Selector & Efficiency Breakdown
         Row(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            MiniMetricPill(
-                label = "PACK VOLTS",
-                value = telemetry.packVoltageVolts?.let { String.format(Locale.US, "%.1f V", it) } ?: "--.- V",
-                accent = ElectricCyan,
-                modifier = Modifier.weight(1f)
+            val isEcoSelected = selectedRangeMode != RideMode.POWER
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(if (isEcoSelected) NeonMint.copy(alpha = 0.16f) else SlateSurface)
+                    .border(
+                        1.dp,
+                        if (isEcoSelected) NeonMint else SlateBorder,
+                        RoundedCornerShape(12.dp)
+                    )
+                    .clickable { onSelectRangeMode(RideMode.ECO) }
+                    .padding(horizontal = 12.dp, vertical = 10.dp)
+                    .testTag("true_range_eco_card")
+            ) {
+                Column {
+                    Text(
+                        text = "TRUE RANGE (ECO)",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (isEcoSelected) NeonMint else TextSecondary
+                    )
+                    Text(
+                        text = trueRange.trueEcoRangeKm?.let { String.format(Locale.US, "%.1f km", it) } ?: "--.- km",
+                        style = MaterialTheme.typography.headlineMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = TextPrimary
+                    )
+                    Text(
+                        text = String.format(Locale.US, "Rate: %.2f km / 1%%", trueRange.ecoKmPerPct),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = NeonMint
+                    )
+                }
+            }
+
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(if (!isEcoSelected) EnergeticCoral.copy(alpha = 0.16f) else SlateSurface)
+                    .border(
+                        1.dp,
+                        if (!isEcoSelected) EnergeticCoral else SlateBorder,
+                        RoundedCornerShape(12.dp)
+                    )
+                    .clickable { onSelectRangeMode(RideMode.POWER) }
+                    .padding(horizontal = 12.dp, vertical = 10.dp)
+                    .testTag("true_range_power_card")
+            ) {
+                Column {
+                    Text(
+                        text = "TRUE RANGE (POWER)",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (!isEcoSelected) EnergeticCoral else TextSecondary
+                    )
+                    Text(
+                        text = trueRange.truePowerRangeKm?.let { String.format(Locale.US, "%.1f km", it) } ?: "--.- km",
+                        style = MaterialTheme.typography.headlineMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = TextPrimary
+                    )
+                    Text(
+                        text = String.format(Locale.US, "Rate: %.2f km / 1%%", trueRange.powerKmPerPct),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = EnergeticCoral
+                    )
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(8.dp))
+
+        // True Range Data Source Badge + 0x13/0x11 Flags
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(10.dp))
+                .background(SlateSurface)
+                .border(1.dp, SlateBorder, RoundedCornerShape(10.dp))
+                .padding(horizontal = 12.dp, vertical = 8.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = trueRange.calculationSourceLabel,
+                style = MaterialTheme.typography.labelSmall,
+                color = if (trueRange.isUsingLearnedEfficiency) NeonMint else ElectricCyan,
+                modifier = Modifier.testTag("true_range_source_label")
             )
-            MiniMetricPill(
-                label = "EFFICIENCY",
-                value = telemetry.efficiencyWhPerKm?.let { "$it Wh/km" } ?: "-- Wh/km",
-                accent = NeonMint,
-                modifier = Modifier.weight(1f)
-            )
-            MiniMetricPill(
-                label = "REGEN BRAKE",
-                value = if (telemetry.isRegenActive) "ACTIVE" else "IDLE",
-                accent = if (telemetry.isRegenActive) NeonMint else TextSecondary,
-                modifier = Modifier.weight(1f)
+            val flag0x13 = telemetry.stateFlag0x13Byte5?.let { String.format("0x%02X", it) } ?: "--"
+            val flag0x11 = telemetry.chargingFlag0x11Byte5?.let { String.format("0x%02X", it) } ?: "--"
+            Text(
+                text = "13[B5]:$flag0x13 • 11[B5]:$flag0x11",
+                style = MaterialTheme.typography.labelSmall,
+                fontWeight = FontWeight.Bold,
+                color = if (telemetry.isCharging) NeonMint else TextSecondary
             )
         }
     }
 }
 
 @Composable
-private fun MiniMetricPill(
-    label: String,
-    value: String,
-    accent: Color,
-    modifier: Modifier = Modifier
+private fun LiveChargingMonitorCard(
+    telemetry: TelemetryState,
+    chargingMonitor: ChargingMonitorState,
+    trueRange: TrueRangeCalculation,
+    onSimulateChargingStepClick: () -> Unit
 ) {
+    val etaFmt = remember { SimpleDateFormat("hh:mm a", Locale.US) }
+    val nowMs = System.currentTimeMillis()
+
+    val eta80Clock = chargingMonitor.remainingSecondsTo80?.let {
+        etaFmt.format(Date(nowMs + it * 1000L))
+    } ?: "--:--"
+    val eta100Clock = chargingMonitor.remainingSecondsTo100?.let {
+        etaFmt.format(Date(nowMs + it * 1000L))
+    } ?: "--:--"
+
     Column(
-        modifier = modifier
-            .clip(RoundedCornerShape(12.dp))
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(18.dp))
             .background(SlateSurface)
-            .border(1.dp, SlateBorder, RoundedCornerShape(12.dp))
-            .padding(horizontal = 10.dp, vertical = 8.dp),
-        horizontalAlignment = Alignment.CenterHorizontally
+            .border(1.5.dp, NeonMint.copy(alpha = 0.7f), RoundedCornerShape(18.dp))
+            .padding(16.dp)
+            .testTag("live_charging_monitor_card"),
+        verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
-        Text(
-            text = label,
-            style = MaterialTheme.typography.labelSmall,
-            color = TextSecondary
-        )
-        Spacer(modifier = Modifier.height(2.dp))
-        Text(
-            text = value,
-            style = MaterialTheme.typography.labelLarge,
-            fontWeight = FontWeight.Bold,
-            color = accent
-        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    imageVector = Icons.Default.Bolt,
+                    contentDescription = "Charging Active",
+                    tint = NeonMint,
+                    modifier = Modifier.size(20.dp)
+                )
+                Spacer(modifier = Modifier.width(6.dp))
+                Column {
+                    Text(
+                        text = "CHARGING ACTIVE • 3-TIER TIME PREDICTOR",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = NeonMint
+                    )
+                    Text(
+                        text = chargingMonitor.predictionModeLabel,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (chargingMonitor.isUsingLiveStepTiming) ElectricCyan else AmberWarning
+                    )
+                }
+            }
+            OutlinedButton(
+                onClick = onSimulateChargingStepClick,
+                modifier = Modifier.testTag("simulate_1pct_step_button")
+            ) {
+                Text("+1% Step (115.7s)", color = NeonMint, style = MaterialTheme.typography.labelSmall)
+            }
+        }
+
+        // Live SoC, Cluster Range (0x13), True Eco Range & Speed (+31.1%/hr = 115.7s/%)
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(SlateCardElevated)
+                    .padding(10.dp)
+            ) {
+                Text("LIVE SoC & GAIN", style = MaterialTheme.typography.labelSmall, color = TextSecondary)
+                Text(
+                    text = "${chargingMonitor.currentBatteryPct ?: "--"}% (+${chargingMonitor.pctGainedThisSession}%)",
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.Bold,
+                    color = NeonMint
+                )
+                Text(
+                    text = "0x11 Mirror: ${telemetry.socMirror0x11 ?: "--"}%",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = TextSecondary
+                )
+            }
+
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(SlateCardElevated)
+                    .padding(10.dp)
+            ) {
+                Text("CLUSTER vs TRUE ECO", style = MaterialTheme.typography.labelSmall, color = TextSecondary)
+                Text(
+                    text = "${telemetry.clusterRangeKm?.let { String.format(Locale.US, "%.1f", it) } ?: "--"} / ${trueRange.trueEcoRangeKm?.let { String.format(Locale.US, "%.1f", it) } ?: "--"} km",
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.Bold,
+                    color = ElectricCyan
+                )
+                Text(
+                    text = "0x13 B3..4 vs True Eco",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = TextSecondary
+                )
+            }
+
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(SlateCardElevated)
+                    .padding(10.dp)
+            ) {
+                Text("CHARGE SPEED", style = MaterialTheme.typography.labelSmall, color = TextSecondary)
+                Text(
+                    text = "+${chargingMonitor.chargingSpeedPctPerHour}% / hr",
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.Bold,
+                    color = AmberWarning
+                )
+                Text(
+                    text = "${chargingMonitor.activeSecondsPerPct}s per +1%",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = TextSecondary
+                )
+            }
+        }
+
+        // Countdown & Clock ETAs for Estimated Time to 80% and Estimated Time to 100%
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(SlateCardElevated)
+                    .border(1.dp, ElectricCyan.copy(alpha = 0.45f), RoundedCornerShape(12.dp))
+                    .padding(12.dp)
+            ) {
+                Text(
+                    text = "ESTIMATED TIME TO 80%",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = ElectricCyan
+                )
+                Text(
+                    text = formatDurationSeconds(chargingMonitor.remainingSecondsTo80),
+                    style = MaterialTheme.typography.headlineMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = TextPrimary,
+                    modifier = Modifier.testTag("charging_eta_80_text")
+                )
+                Text(
+                    text = "80% at $eta80Clock  •  Base: ${formatDurationSeconds(chargingMonitor.baselineRemainingSecondsTo80)}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = TextSecondary
+                )
+            }
+
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(SlateCardElevated)
+                    .border(1.dp, NeonMint.copy(alpha = 0.45f), RoundedCornerShape(12.dp))
+                    .padding(12.dp)
+            ) {
+                Text(
+                    text = "ESTIMATED TIME TO FULL (100%)",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = NeonMint
+                )
+                Text(
+                    text = formatDurationSeconds(chargingMonitor.remainingSecondsTo100),
+                    style = MaterialTheme.typography.headlineMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = TextPrimary,
+                    modifier = Modifier.testTag("charging_eta_100_text")
+                )
+                Text(
+                    text = "100% at $eta100Clock  •  Base: ${formatDurationSeconds(chargingMonitor.baselineRemainingSecondsTo100)}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = TextSecondary
+                )
+            }
+        }
+    }
+}
+
+private fun formatDurationSeconds(seconds: Long?): String {
+    if (seconds == null) return "--h --m"
+    if (seconds <= 0L) return "REACHED"
+    val hrs = seconds / 3600L
+    val mins = (seconds % 3600L) / 60L
+    val secs = seconds % 60L
+    return if (hrs > 0L) {
+        String.format(Locale.US, "%dh %02dm", hrs, mins)
+    } else {
+        String.format(Locale.US, "%dm %02ds", mins, secs)
     }
 }
 
 @Composable
 private fun LiveTelemetryStripSection(
     telemetry: TelemetryState,
+    lastSeenState: LastSeenScooterState?,
     onSelectTripTab: (Int) -> Unit
 ) {
+    val effectiveOdoKm = telemetry.odometerKm ?: lastSeenState?.odometerKm
+    val effectiveTripAKm = telemetry.tripAKm ?: lastSeenState?.tripAKm
+    val effectiveTripBKm = telemetry.tripBKm ?: lastSeenState?.tripBKm
+
     Column(
         modifier = Modifier.fillMaxWidth(),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
         Text(
-            text = "LIVE TELEMETRY STREAM (PACKETS 0x10 / 0x11 / 0x7D)",
+            text = "UNFILTERED 20-BYTE TELEMETRY (0x10 SPEED+ODO • 0x11 TRIPS+CHG • 0x7D ID)",
             style = MaterialTheme.typography.labelMedium,
             color = TextSecondary
         )
@@ -352,7 +832,7 @@ private fun LiveTelemetryStripSection(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            // Left Card: Real-Time Speedometer, Peak Speed & Acceleration (Opcode 0x10)
+            // Left Card: Real-Time Speedometer & Total Hardware Odometer (0x5A 0x10 Bytes 2..5)
             Column(
                 modifier = Modifier
                     .weight(1f)
@@ -375,7 +855,7 @@ private fun LiveTelemetryStripSection(
                         )
                         Spacer(modifier = Modifier.width(6.dp))
                         Text(
-                            text = "WHEEL SPEED",
+                            text = "SPEED (0x10 B2)",
                             style = MaterialTheme.typography.labelSmall,
                             color = TextSecondary
                         )
@@ -391,7 +871,7 @@ private fun LiveTelemetryStripSection(
 
                 Row(verticalAlignment = Alignment.Bottom) {
                     Text(
-                        text = telemetry.speedKmh?.toString() ?: "--",
+                        text = telemetry.speedKmh?.toString() ?: "0",
                         style = MaterialTheme.typography.displayLarge,
                         color = if ((telemetry.speedKmh ?: 0) >= 48) EnergeticCoral else TextPrimary,
                         modifier = Modifier.testTag("live_speed_text")
@@ -409,16 +889,15 @@ private fun LiveTelemetryStripSection(
 
                 val accelText = telemetry.accelerationMs2?.let {
                     String.format(Locale.US, "%+.2f m/s²", it)
-                } ?: "--.-- m/s²"
+                } ?: "0.00 m/s²"
                 Text(
-                    text = "ACCEL: $accelText • THR: ${telemetry.throttlePercent?.let { "$it%" } ?: "--%"}",
+                    text = "ACCEL: $accelText • ID: ${telemetry.vehicleIdString ?: IqubeBleSpec.CLUSTER_VEHICLE_ID_DEFAULT}",
                     style = MaterialTheme.typography.labelSmall,
                     color = TextSecondary
                 )
 
                 Spacer(modifier = Modifier.height(6.dp))
 
-                // 0-30 & 0-40 km/h Automatic Drag Timer
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -440,7 +919,7 @@ private fun LiveTelemetryStripSection(
                 }
             }
 
-            // Right Card: Switchable Trip A / Trip B / ODO / Sub-Meter Integrated Card (Opcode 0x11 & 0x10)
+            // Right Card: Switchable Trip A (0x11 B2..4) / Trip B (0x11 B7..9) / Total ODO (0x10 B3..5 = 35,925.2 km)
             Column(
                 modifier = Modifier
                     .weight(1f)
@@ -484,10 +963,10 @@ private fun LiveTelemetryStripSection(
                 Spacer(modifier = Modifier.height(10.dp))
 
                 val primaryDistanceText = when (telemetry.activeTripTab) {
-                    0 -> telemetry.tripAKm?.let { String.format(Locale.US, "%.1f km", it) } ?: "--.- km"
-                    1 -> telemetry.tripBKm?.let { String.format(Locale.US, "%.1f km", it) } ?: "--.- km"
-                    2 -> telemetry.odometerKm?.let { String.format(Locale.US, "%,.1f km", it) } ?: "--.- km"
-                    else -> String.format(Locale.US, "%.1f m", telemetry.integratedDistanceMeters)
+                    0 -> effectiveTripAKm?.let { String.format(Locale.US, "%.1f km", it) } ?: "--.- km"
+                    1 -> effectiveTripBKm?.let { String.format(Locale.US, "%.1f km", it) } ?: "--.- km"
+                    2 -> effectiveOdoKm?.let { String.format(Locale.US, "%,.1f km", it) } ?: "--.- km"
+                    else -> String.format(Locale.US, "%.2f km", telemetry.integratedDistanceMeters / 1000.0)
                 }
 
                 Text(
@@ -500,14 +979,13 @@ private fun LiveTelemetryStripSection(
                 Spacer(modifier = Modifier.height(4.dp))
 
                 Text(
-                    text = "INTEGRATED: ${String.format(Locale.US, "%.1f m", telemetry.integratedDistanceMeters)} (${String.format(Locale.US, "%.1f km", telemetry.clusterIntegratedStepKm)})",
+                    text = "TRIP A: ${effectiveTripAKm?.let { "${it}km" } ?: "--"} • TRIP B: ${effectiveTripBKm?.let { "${it}km" } ?: "--"}",
                     style = MaterialTheme.typography.labelSmall,
                     color = NeonMint
                 )
 
                 Spacer(modifier = Modifier.height(6.dp))
 
-                // Hardware Odometer + 0x11 2.02s Sync Pulse Indicator
                 val isOdoSynced = telemetry.lastOdometerSyncMs != null &&
                     (System.currentTimeMillis() - telemetry.lastOdometerSyncMs < 2200L)
                 Row(
@@ -520,7 +998,7 @@ private fun LiveTelemetryStripSection(
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
                     Text(
-                        text = "ODO: ${telemetry.odometerKm?.let { String.format(Locale.US, "%,.1f km", it) } ?: "-- km"}",
+                        text = "ODO (0x10 B3..5): ${effectiveOdoKm?.let { String.format(Locale.US, "%,.1f km", it) } ?: "-- km"}",
                         style = MaterialTheme.typography.labelSmall,
                         color = TextSecondary
                     )
@@ -533,7 +1011,7 @@ private fun LiveTelemetryStripSection(
                         )
                         Spacer(modifier = Modifier.width(4.dp))
                         Text(
-                            text = "0x11",
+                            text = "24B BE",
                             style = MaterialTheme.typography.labelSmall,
                             color = if (isOdoSynced) NeonMint else TextSecondary
                         )
@@ -546,13 +1024,11 @@ private fun LiveTelemetryStripSection(
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun InteractiveCommandDeckCard(
-    isLampOn: Boolean,
-    onResetTripClick: () -> Unit,
-    onCycleTripClick: () -> Unit,
-    onPushSampleNavClick: () -> Unit,
-    onSendSampleCallAlertClick: () -> Unit,
-    onToggleLampClick: () -> Unit
+private fun VerifiedTripControlsCard(
+    tripSubcommandConfig: TripSubcommandConfig,
+    onSwitchToTripAClick: () -> Unit,
+    onSwitchToTripBClick: () -> Unit,
+    onResetActiveTripClick: () -> Unit
 ) {
     Column(
         modifier = Modifier
@@ -569,12 +1045,12 @@ private fun InteractiveCommandDeckCard(
             verticalAlignment = Alignment.CenterVertically
         ) {
             Text(
-                text = "ACTION SHORTCUTS (FIFO WRITE TO 0x5352 / 0x0022)",
+                text = "VERIFIED TRIP CONTROLS (0x5352 / HANDLE 0x0022 • 5A F1 00 … FF)",
                 style = MaterialTheme.typography.labelMedium,
                 color = TextSecondary
             )
             Text(
-                text = "5A..FF GUARDED",
+                text = "BYTE 19 = 0xFF",
                 style = MaterialTheme.typography.labelSmall,
                 color = NeonMint
             )
@@ -587,52 +1063,241 @@ private fun InteractiveCommandDeckCard(
             maxItemsInEachRow = 2
         ) {
             CommandShortcutButton(
-                title = "Reset Trip A",
-                subtitle = "5A F1 00 02 … FF",
-                icon = Icons.Default.Refresh,
-                accentColor = EnergeticCoral,
-                testTag = "cmd_reset_trip_button",
-                onClick = onResetTripClick,
+                title = "Switch to Trip A",
+                subtitle = String.format(Locale.US, "5A F1 00 %02X … FF", tripSubcommandConfig.switchTripAByte),
+                icon = Icons.Default.SwapHoriz,
+                accentColor = NeonMint,
+                testTag = "cmd_switch_trip_a_button",
+                onClick = onSwitchToTripAClick,
                 modifier = Modifier.weight(1f)
             )
             CommandShortcutButton(
-                title = "Cycle Trip A/B",
-                subtitle = "5A F1 00 01 … FF",
+                title = "Switch to Trip B",
+                subtitle = String.format(Locale.US, "5A F1 00 %02X … FF", tripSubcommandConfig.switchTripBByte),
                 icon = Icons.Default.SwapHoriz,
                 accentColor = ElectricCyan,
-                testTag = "cmd_cycle_trip_button",
-                onClick = onCycleTripClick,
-                modifier = Modifier.weight(1f)
-            )
-            CommandShortcutButton(
-                title = "Push Route Nav",
-                subtitle = "5B 5C 57 ([\\W) 180m",
-                icon = Icons.Default.Navigation,
-                accentColor = NeonMint,
-                testTag = "cmd_push_nav_button",
-                onClick = onPushSampleNavClick,
-                modifier = Modifier.weight(1f)
-            )
-            CommandShortcutButton(
-                title = "Send Call Alert",
-                subtitle = "5B 5D 43 ([]C) Banner",
-                icon = Icons.Default.NotificationsActive,
-                accentColor = AmberWarning,
-                testTag = "cmd_send_alert_button",
-                onClick = onSendSampleCallAlertClick,
+                testTag = "cmd_switch_trip_b_button",
+                onClick = onSwitchToTripBClick,
                 modifier = Modifier.weight(1f)
             )
         }
 
         CommandShortcutButton(
-            title = if (isLampOn) "Dashboard Cluster Lamp: ON (Tap to Toggle)" else "Dashboard Cluster Lamp: OFF (Tap to Toggle)",
-            subtitle = "5A F1 00 03 … FF (20-Byte Framed Control)",
-            icon = Icons.Default.LightMode,
-            accentColor = if (isLampOn) NeonMint else ElectricCyan,
-            testTag = "cmd_toggle_lamp_button",
-            onClick = onToggleLampClick,
+            title = "Reset Active Trip (A/B)",
+            subtitle = String.format(
+                Locale.US,
+                "5A F1 00 %02X … FF (Resets whichever trip is currently active on scooter display)",
+                tripSubcommandConfig.resetActiveTripByte
+            ),
+            icon = Icons.Default.Refresh,
+            accentColor = EnergeticCoral,
+            testTag = "cmd_reset_active_trip_button",
+            onClick = onResetActiveTripClick,
             modifier = Modifier.fillMaxWidth()
         )
+    }
+}
+
+@Composable
+private fun ClusterLocationSyncCard(
+    detectedLocalityName: String,
+    customLocationOverride: String,
+    lastSyncedClusterLocation: String?,
+    autoLocationSyncEnabled: Boolean,
+    isCallRinging: Boolean,
+    onCustomLocationOverrideChange: (String) -> Unit,
+    onSetAutoLocationSync: (Boolean) -> Unit,
+    onDumpLocationNowClick: () -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(18.dp))
+            .background(SlateSurface)
+            .border(1.dp, SlateBorder, RoundedCornerShape(18.dp))
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
+                Icon(
+                    imageVector = Icons.Default.LocationOn,
+                    contentDescription = "Cluster Location Sync",
+                    tint = ElectricCyan,
+                    modifier = Modifier.size(18.dp)
+                )
+                Spacer(modifier = Modifier.width(6.dp))
+                Column {
+                    Text(
+                        text = "LIVE GPS LOCATION DUMP (0x5B 0x5C + 17B ASCII + 0xFF)",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = ElectricCyan
+                    )
+                    Text(
+                        text = "Locality: \"$detectedLocalityName\" • Cluster: \"${lastSyncedClusterLocation ?: "--"}\"${if (isCallRinging) " (Paused for Call)" else ""}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = TextSecondary
+                    )
+                }
+            }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = "Auto 10s",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = TextSecondary
+                )
+                Spacer(modifier = Modifier.width(6.dp))
+                Switch(
+                    checked = autoLocationSyncEnabled,
+                    onCheckedChange = onSetAutoLocationSync
+                )
+            }
+        }
+
+        OutlinedTextField(
+            value = customLocationOverride,
+            onValueChange = { onCustomLocationOverrideChange(it.take(IqubeBleSpec.MAX_LOCATION_ASCII_BYTES)) },
+            label = {
+                Text("Custom 17-Char Cluster Location Override (Bytes 2..18, Byte 19=0xFF)")
+            },
+            singleLine = true,
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag("cockpit_location_override_input")
+        )
+
+        Button(
+            onClick = onDumpLocationNowClick,
+            colors = ButtonDefaults.buttonColors(containerColor = ElectricCyan, contentColor = SlateSurface),
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag("cmd_dump_location_button")
+        ) {
+            Icon(
+                imageVector = Icons.AutoMirrored.Filled.Send,
+                contentDescription = "Dump Current Location to Cluster",
+                modifier = Modifier.size(16.dp)
+            )
+            Spacer(modifier = Modifier.width(8.dp))
+            val targetName = customLocationOverride.ifBlank { detectedLocalityName }.take(IqubeBleSpec.MAX_LOCATION_ASCII_BYTES)
+            Text(
+                text = "Dump Current Location to Cluster (\"$targetName\" + 0xFF)",
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = FontWeight.Bold
+            )
+        }
+    }
+}
+
+@Composable
+private fun IncomingCallClusterRelayCard(
+    incomingCallState: IncomingCallRelayState,
+    detectedLocalityName: String,
+    onTriggerCall: (String) -> Unit,
+    onEndCall: () -> Unit
+) {
+    var callerInput by remember { mutableStateOf(incomingCallState.fullCallerName) }
+    val extractedFirst = remember(callerInput) {
+        callerInput.trim().split(Regex("\\s+")).firstOrNull()?.replace(Regex("[^\\x20-\\x7E]"), "")?.ifBlank { "Caller" } ?: "Caller"
+    }
+    val previewClusterText = remember(extractedFirst) {
+        "CALL:$extractedFirst".take(IqubeBleSpec.MAX_LOCATION_ASCII_BYTES)
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(18.dp))
+            .background(SlateSurface)
+            .border(
+                1.dp,
+                if (incomingCallState.isRinging) AmberWarning else SlateBorder,
+                RoundedCornerShape(18.dp)
+            )
+            .padding(16.dp)
+            .testTag("incoming_call_relay_card"),
+        verticalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    imageVector = Icons.Default.Call,
+                    contentDescription = "Incoming Call Cluster Relay",
+                    tint = AmberWarning,
+                    modifier = Modifier.size(18.dp)
+                )
+                Spacer(modifier = Modifier.width(6.dp))
+                Column {
+                    Text(
+                        text = "INCOMING CALL CLUSTER RELAY (1ST NAME + CALL SYMBOL)",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = AmberWarning
+                    )
+                    Text(
+                        text = "Extracts 1st Name → Pushes [0x5B, 0x5C, \"$previewClusterText\", 0xFF] • Auto-restores \"$detectedLocalityName\" on end",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = TextSecondary
+                    )
+                }
+            }
+        }
+
+        OutlinedTextField(
+            value = callerInput,
+            onValueChange = { callerInput = it },
+            label = { Text("Caller Full Name (Extracts 1st Name: '$extractedFirst' → '$previewClusterText')") },
+            singleLine = true,
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag("caller_name_input")
+        )
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Button(
+                onClick = { onTriggerCall(callerInput) },
+                colors = ButtonDefaults.buttonColors(containerColor = AmberWarning, contentColor = SlateSurface),
+                modifier = Modifier
+                    .weight(1f)
+                    .testTag("trigger_call_alert_button")
+            ) {
+                Icon(Icons.Default.Call, contentDescription = "Ring Cluster", modifier = Modifier.size(16.dp))
+                Spacer(modifier = Modifier.width(6.dp))
+                Text(
+                    text = "Ring (\"$previewClusterText\")",
+                    style = MaterialTheme.typography.labelLarge,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+
+            if (incomingCallState.isRinging) {
+                Button(
+                    onClick = onEndCall,
+                    colors = ButtonDefaults.buttonColors(containerColor = EnergeticCoral, contentColor = SlateSurface),
+                    modifier = Modifier
+                        .weight(1f)
+                        .testTag("end_call_alert_button")
+                ) {
+                    Icon(Icons.Default.CallEnd, contentDescription = "End Call", modifier = Modifier.size(16.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = "End Call (Restore GPS)",
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
+        }
     }
 }
 

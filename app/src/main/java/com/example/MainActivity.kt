@@ -23,10 +23,12 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Code
 import androidx.compose.material.icons.filled.Dashboard
 import androidx.compose.material.icons.filled.Explore
+import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.outlined.Code
 import androidx.compose.material.icons.outlined.Dashboard
 import androidx.compose.material.icons.outlined.Explore
+import androidx.compose.material.icons.outlined.History
 import androidx.compose.material.icons.outlined.Tune
 import androidx.compose.material3.Icon
 import androidx.compose.material3.NavigationBar
@@ -50,6 +52,7 @@ import com.example.ui.screens.CockpitDashboardScreen
 import com.example.ui.screens.CommandStudioScreen
 import com.example.ui.screens.GpsRideLoggerScreen
 import com.example.ui.screens.HexInspectorScreen
+import com.example.ui.screens.SavedTripsHistoryScreen
 import com.example.ui.theme.ElectricCyan
 import com.example.ui.theme.MyApplicationTheme
 import com.example.ui.theme.ObsidianBg
@@ -84,10 +87,24 @@ fun IqubeCompanionApp(
     val linkWarningMessage by viewModel.linkWarningMessage.collectAsStateWithLifecycle()
     val autoReconnectEnabled by viewModel.autoReconnectEnabled.collectAsStateWithLifecycle()
     val heartbeatEnabled by viewModel.heartbeatEnabled.collectAsStateWithLifecycle()
+    val autoLocationSyncEnabled by viewModel.autoLocationSyncEnabled.collectAsStateWithLifecycle()
     val fragmentedSliceTestEnabled by viewModel.fragmentedSliceTestEnabled.collectAsStateWithLifecycle()
 
     val telemetry by viewModel.telemetryState.collectAsStateWithLifecycle()
     val byteOffsetMapping by viewModel.byteOffsetMapping.collectAsStateWithLifecycle()
+    val tripSubcommandConfig by viewModel.tripSubcommandConfig.collectAsStateWithLifecycle()
+    val trueRange by viewModel.trueRangeState.collectAsStateWithLifecycle()
+    val chargingMonitor by viewModel.chargingMonitorState.collectAsStateWithLifecycle()
+    val lastSeenState by viewModel.lastSeenState.collectAsStateWithLifecycle()
+    val incomingCallState by viewModel.incomingCallState.collectAsStateWithLifecycle()
+    val selectedRangeMode by viewModel.selectedRangeMode.collectAsStateWithLifecycle()
+    val savedTrips by viewModel.savedTrips.collectAsStateWithLifecycle()
+    val activeTripSession by viewModel.activeTripSession.collectAsStateWithLifecycle()
+
+    val detectedLocalityName by viewModel.detectedLocalityName.collectAsStateWithLifecycle()
+    val customLocationOverride by viewModel.customLocationOverride.collectAsStateWithLifecycle()
+    val lastSyncedClusterLocation by viewModel.lastSyncedClusterLocation.collectAsStateWithLifecycle()
+
     val commandHistory by viewModel.commandHistory.collectAsStateWithLifecycle()
     val queueDepth by viewModel.queueDepth.collectAsStateWithLifecycle()
 
@@ -95,7 +112,6 @@ fun IqubeCompanionApp(
     val lastParkedLocation by viewModel.lastParkedLocation.collectAsStateWithLifecycle()
     val gpsFusionSamples by viewModel.gpsFusionSamples.collectAsStateWithLifecycle()
 
-    // Runtime BLE & Location permissions launcher before scanning real BLE hardware
     val blePermissionsLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions()
     ) { _ ->
@@ -118,7 +134,6 @@ fun IqubeCompanionApp(
         blePermissionsLauncher.launch(requiredPermissions)
     }
 
-    // BackHandler on sub-screens to return to Cockpit Dashboard
     BackHandler(enabled = currentDestination != DashboardDestination.COCKPIT) {
         viewModel.navigateTo(DashboardDestination.COCKPIT)
     }
@@ -158,16 +173,18 @@ fun IqubeCompanionApp(
                 Column(modifier = Modifier.fillMaxSize()) {
                     TopConnectionHeader(
                         connectionPhase = connectionPhase,
-                        deviceName = deviceName,
+                        deviceName = telemetry.vehicleIdString ?: deviceName,
                         deviceMac = deviceMac,
                         rssiDbm = rssiDbm,
                         negotiatedMtu = negotiatedMtu,
                         isIgnitionUnlocked = telemetry.isIgnitionUnlocked,
                         rideMode = telemetry.rideMode,
+                        isCharging = telemetry.isCharging,
                         isLinkDegraded = isLinkDegraded,
                         linkWarningMessage = linkWarningMessage,
                         onConnectBleClick = triggerBleScanWithPermissions,
-                        onReplayHciClick = viewModel::startHciLogReplay,
+                        onReplayRidingClick = viewModel::startRidingLogReplay,
+                        onReplayChargingClick = viewModel::startChargingLogReplay,
                         onDisconnectClick = viewModel::disconnectBle
                     )
 
@@ -176,15 +193,41 @@ fun IqubeCompanionApp(
                             DashboardDestination.COCKPIT -> {
                                 CockpitDashboardScreen(
                                     telemetry = telemetry,
+                                    trueRange = trueRange,
+                                    chargingMonitor = chargingMonitor,
+                                    lastSeenState = lastSeenState,
+                                    incomingCallState = incomingCallState,
+                                    selectedRangeMode = selectedRangeMode,
+                                    detectedLocalityName = detectedLocalityName,
+                                    customLocationOverride = customLocationOverride,
+                                    lastSyncedClusterLocation = lastSyncedClusterLocation,
+                                    autoLocationSyncEnabled = autoLocationSyncEnabled,
+                                    tripSubcommandConfig = tripSubcommandConfig,
+                                    onSelectRangeMode = viewModel::setSelectedRangeMode,
                                     onSelectTripTab = viewModel::setActiveTripTab,
-                                    onResetTripClick = viewModel::sendResetTripCommand,
-                                    onCycleTripClick = viewModel::sendCycleTripCommand,
-                                    onPushSampleNavClick = { icon, dist, road ->
-                                        viewModel.sendNavigationInstruction(icon, dist, road, false)
-                                    },
-                                    onSendSampleCallAlertClick = viewModel::sendCallerOrAlertBanner,
-                                    onToggleLampClick = viewModel::sendToggleDashboardLampCommand,
+                                    onSwitchToTripAClick = viewModel::sendSwitchToTripACommand,
+                                    onSwitchToTripBClick = viewModel::sendSwitchToTripBCommand,
+                                    onResetActiveTripClick = viewModel::sendResetActiveTripCommand,
+                                    onDumpLocationToClusterClick = { viewModel.dumpLocationToClusterNow(null) },
+                                    onCustomLocationOverrideChange = viewModel::setCustomLocationOverride,
+                                    onSetAutoLocationSync = viewModel::setAutoLocationSyncEnabled,
+                                    onTriggerIncomingCallClick = viewModel::triggerIncomingCallAlert,
+                                    onEndIncomingCallClick = viewModel::endIncomingCallAlert,
+                                    onSimulateChargingStepClick = viewModel::simulateLiveOnePercentChargingStep,
                                     onToggleChargingClick = viewModel::toggleReplayChargingState
+                                )
+                            }
+                            DashboardDestination.SAVED_TRIPS -> {
+                                SavedTripsHistoryScreen(
+                                    savedTrips = savedTrips,
+                                    activeTripSession = activeTripSession,
+                                    telemetry = telemetry,
+                                    trueRange = trueRange,
+                                    onLogSampleTripClick = viewModel::logSampleVerifiedTrip,
+                                    onDeleteTripClick = viewModel::deleteSavedTrip,
+                                    onClearAllTripsClick = viewModel::clearAllSavedTrips,
+                                    onExportCsv = viewModel::exportSavedTripsCsv,
+                                    onExportJson = viewModel::exportSavedTripsJson
                                 )
                             }
                             DashboardDestination.COMMAND_STUDIO -> {
@@ -192,9 +235,19 @@ fun IqubeCompanionApp(
                                     commandHistory = commandHistory,
                                     queueDepth = queueDepth,
                                     heartbeatEnabled = heartbeatEnabled,
+                                    autoLocationSyncEnabled = autoLocationSyncEnabled,
+                                    detectedLocalityName = detectedLocalityName,
+                                    customLocationOverride = customLocationOverride,
+                                    lastSyncedClusterLocation = lastSyncedClusterLocation,
+                                    tripSubcommandConfig = tripSubcommandConfig,
                                     onSetHeartbeatEnabled = viewModel::setHeartbeatEnabled,
-                                    onSendNavigation = viewModel::sendNavigationInstruction,
-                                    onSendCallerAlert = viewModel::sendCallerOrAlertBanner,
+                                    onSetAutoLocationSync = viewModel::setAutoLocationSyncEnabled,
+                                    onCustomLocationOverrideChange = viewModel::setCustomLocationOverride,
+                                    onDumpLocationToCluster = viewModel::dumpLocationToClusterNow,
+                                    onUpdateTripSubcommandConfig = viewModel::updateTripSubcommandConfig,
+                                    onSwitchToTripAClick = viewModel::sendSwitchToTripACommand,
+                                    onSwitchToTripBClick = viewModel::sendSwitchToTripBCommand,
+                                    onResetActiveTripClick = viewModel::sendResetActiveTripCommand,
                                     onSendCustomHex = viewModel::sendCustomHexFrame
                                 )
                             }
@@ -202,6 +255,7 @@ fun IqubeCompanionApp(
                                 GpsRideLoggerScreen(
                                     telemetry = telemetry,
                                     currentGpsSpeedKmh = currentGpsSpeedKmh,
+                                    detectedLocalityName = detectedLocalityName,
                                     lastParkedLocation = lastParkedLocation,
                                     gpsFusionSamples = gpsFusionSamples,
                                     autoReconnectEnabled = autoReconnectEnabled,
@@ -290,6 +344,7 @@ private fun IqubeSideNavigationRail(
 
 private fun destinationIcon(dest: DashboardDestination, selected: Boolean) = when (dest) {
     DashboardDestination.COCKPIT -> if (selected) Icons.Filled.Dashboard else Icons.Outlined.Dashboard
+    DashboardDestination.SAVED_TRIPS -> if (selected) Icons.Filled.History else Icons.Outlined.History
     DashboardDestination.COMMAND_STUDIO -> if (selected) Icons.Filled.Tune else Icons.Outlined.Tune
     DashboardDestination.GPS_LOGGER -> if (selected) Icons.Filled.Explore else Icons.Outlined.Explore
     DashboardDestination.HEX_INSPECTOR -> if (selected) Icons.Filled.Code else Icons.Outlined.Code

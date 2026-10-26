@@ -3,16 +3,19 @@ package com.example
 import com.example.ble.HciLogReplayDataset
 import com.example.ble.IqubeCommandDispatcher
 import com.example.ble.IqubePacketParser
-import com.example.model.ClusterAlertType
-import com.example.model.NavigationTurnIcon
+import com.example.ble.TrueRangeAndTripRepository
+import com.example.model.IqubeBleSpec
 import com.example.model.RideMode
+import com.example.model.SavedTripRecord
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.nio.charset.StandardCharsets
 
 class ExampleUnitTest {
 
@@ -22,22 +25,23 @@ class ExampleUnitTest {
         val state = parser.telemetryState.value
         assertNull(state.batteryPercent)
         assertNull(state.speedKmh)
-        assertNull(state.rangeEcoKm)
+        assertNull(state.clusterRangeKm)
         assertNull(state.odometerKm)
         assertNull(state.tripAKm)
+        assertNull(state.vehicleIdString)
     }
 
     @Test
-    fun packetParser_reassemblesFragmentedAttSlicesAndDecodesAllOpcodes() {
+    fun packetParser_decodesUnfiltered20ByteChargingCaptureFramesAndReassemblesSlices() {
         val parser = IqubePacketParser()
 
-        // 1. Fragmented 0x13 Battery frame (8B + 12B slices)
-        val batteryFrame = HciLogReplayDataset.buildBatteryFrame0x13(
-            socPercent = 91,
-            rangeEcoKm = 96,
-            packDecivolts = 512,
-            isCharging = false
+        // 1. Fragmented 0x5A 0x13 Battery + Cluster Range + Charging Flag (0x26 = 38%, 0x0190 = 40.0 km, Byte 5 = 0x06)
+        val batteryFrame = HciLogReplayDataset.buildBatteryRangeFrame0x13(
+            socPercent = 38,
+            clusterRangeTenthsKm = 400, // 0x0190 = 40.0 km
+            isCharging = true
         )
+        assertEquals(0xFF.toByte(), batteryFrame[19])
         val slice1 = batteryFrame.copyOfRange(0, 8)
         val slice2 = batteryFrame.copyOfRange(8, 20)
 
@@ -47,73 +51,170 @@ class ExampleUnitTest {
         val secondResult = parser.ingestRawChunk(slice2, 1010L)
         assertEquals(1, secondResult.size)
 
-        val stateAfterBattery = parser.telemetryState.value
-        assertEquals(91, stateAfterBattery.batteryPercent)
-        assertEquals(96, stateAfterBattery.rangeEcoKm)
-        assertEquals(51.2f, stateAfterBattery.packVoltageVolts ?: 0f, 0.05f)
+        val stateAfter13 = parser.telemetryState.value
+        assertEquals(38, stateAfter13.batteryPercent)
+        assertEquals(40.0, stateAfter13.clusterRangeKm ?: 0.0, 0.01)
+        assertEquals(0x06, stateAfter13.stateFlag0x13Byte5)
+        assertTrue(stateAfter13.isCharging)
 
-        // 2. Speed 0x10 frame integration & 0-30 / 0-40 sprint timer latch
-        parser.ingestRawChunk(HciLogReplayDataset.buildSpeedFrame0x10(0, 0), 2000L)
-        parser.ingestRawChunk(HciLogReplayDataset.buildSpeedFrame0x10(15, 0), 3000L)
-        parser.ingestRawChunk(HciLogReplayDataset.buildSpeedFrame0x10(32, 15), 5200L)
-        parser.ingestRawChunk(HciLogReplayDataset.buildSpeedFrame0x10(44, 32), 6800L)
+        // 2. 0x5A 0x10 Speed + uint24 BE Total Hardware Odometer (Bytes 3..5 = 05 7B 54 = 359,252 = 35,925.2 km)
+        parser.ingestRawChunk(HciLogReplayDataset.buildSpeedOdometerFrame0x10(0, 359252), 2000L)
+        parser.ingestRawChunk(HciLogReplayDataset.buildSpeedOdometerFrame0x10(15, 359252), 3000L)
+        parser.ingestRawChunk(HciLogReplayDataset.buildSpeedOdometerFrame0x10(32, 359252), 5200L)
+        parser.ingestRawChunk(HciLogReplayDataset.buildSpeedOdometerFrame0x10(44, 359252), 6800L)
 
-        val stateAfterSprint = parser.telemetryState.value
-        assertEquals(44, stateAfterSprint.speedKmh)
-        assertEquals(44, stateAfterSprint.peakSpeedKmh)
-        assertNotNull("0-30 km/h sprint timer should latch", stateAfterSprint.sprint0To30Sec)
-        assertNotNull("0-40 km/h sprint timer should latch", stateAfterSprint.sprint0To40Sec)
-        assertTrue(stateAfterSprint.integratedDistanceMeters > 0.0)
+        val stateAfter10 = parser.telemetryState.value
+        assertEquals(44, stateAfter10.speedKmh)
+        assertEquals(44, stateAfter10.peakSpeedKmh)
+        assertEquals(35925.2, stateAfter10.odometerKm ?: 0.0, 0.01)
+        assertNotNull("0-30 km/h sprint timer should latch", stateAfter10.sprint0To30Sec)
+        assertNotNull("0-40 km/h sprint timer should latch", stateAfter10.sprint0To40Sec)
+        assertTrue(stateAfter10.integratedDistanceMeters > 0.0)
 
-        // 3. Cluster status 0x7D frame
-        parser.ingestRawChunk(HciLogReplayDataset.buildClusterStatusFrame0x7D(44, true, true), 7000L)
+        // 3. 0x5A 0x7D Vehicle Model & ID String (Bytes 2..18 = "TVSiQUBEJI573")
+        parser.ingestRawChunk(HciLogReplayDataset.buildVehicleIdentityFrame0x7D("TVSiQUBEJI573"), 7000L)
         val stateAfter7D = parser.telemetryState.value
-        assertEquals(0x54, stateAfter7D.clusterIdentityByte)
-        assertEquals(RideMode.POWER, stateAfter7D.rideMode)
-        assertTrue(stateAfter7D.isRegenActive)
-        assertTrue(stateAfter7D.isDashboardLampOn)
+        assertEquals("TVSiQUBEJI573", stateAfter7D.vehicleIdString)
+        assertEquals(0x54.toByte(), stateAfter7D.latestFrame0x7D?.get(2))
 
-        // 4. Odometer & Trip 0x11 frame
+        // 4. 0x5A 0x11 Trip A (00 00 03 = 0.3 km), Byte 5 = 0x01 (Charging), Byte 6 = 42% mirror, Trip B (00 00 0A = 1.0 km)
         parser.ingestRawChunk(
-            HciLogReplayDataset.buildOdometerFrame0x11(
-                odometerTenthsKm = 17504,
-                tripATenthsKm = 184,
-                tripBTenthsKm = 62
+            HciLogReplayDataset.buildTripsAndChargingFrame0x11(
+                tripATenthsKm = 3,
+                tripBTenthsKm = 10,
+                isChargingActive = true,
+                socMirrorPercent = 42
             ),
             8000L
         )
         val stateAfter11 = parser.telemetryState.value
-        assertEquals(1750.4, stateAfter11.odometerKm ?: 0.0, 0.01)
-        assertEquals(18.4, stateAfter11.tripAKm ?: 0.0, 0.01)
-        assertEquals(6.2, stateAfter11.tripBKm ?: 0.0, 0.01)
+        assertEquals(0.3, stateAfter11.tripAKm ?: 0.0, 0.01)
+        assertEquals(1.0, stateAfter11.tripBKm ?: 0.0, 0.01)
+        assertEquals(0x01, stateAfter11.chargingFlag0x11Byte5)
+        assertEquals(42, stateAfter11.socMirror0x11)
+        assertTrue(stateAfter11.isCharging)
     }
 
     @Test
-    fun commandDispatcher_validatesFramingAndRejectsArbitraryBytes() {
+    fun commandDispatcher_enforcesMandatory0xFFTrailerOnAllOutgoingPackets() {
         val dispatcher = IqubeCommandDispatcher(
             scope = CoroutineScope(Dispatchers.Unconfined),
             performGattWrite = { true },
             onWriteAckTimeout = {}
         )
 
-        // Valid Trip Reset frame (5A F1 00 02 ... FF)
-        val tripReset = dispatcher.buildTripControlFrame(0x02)
-        assertTrue(dispatcher.validateOutgoingFrame(tripReset).isSuccess)
+        // 1. Handshake [RU (0x5B, 0x52, 0x55, 0x01, ..."IQUBE_OSS", ...0x00, 0xFF)
+        val handshake = dispatcher.buildInitialHandshakeFrame()
+        assertEquals(20, handshake.size)
+        assertEquals(0xFF.toByte(), handshake[19])
+        assertTrue(dispatcher.validateOutgoingFrame(handshake).isSuccess)
 
-        // Valid Navigation frame (5B 5C 57 ...)
-        val navFrame = dispatcher.buildNavigationFrame(NavigationTurnIcon.TURN_LEFT, 150, "MG ROAD")
-        assertTrue(dispatcher.validateOutgoingFrame(navFrame).isSuccess)
+        // 2. Clock Heartbeat [JD (0x5B, 0x4A, 0x44, hh, mm, ss, 0x01, ...0x00, 0xFF)
+        val heartbeat = dispatcher.buildHeartbeatSyncFrame()
+        assertEquals(20, heartbeat.size)
+        assertEquals(0xFF.toByte(), heartbeat[19])
+        assertTrue(dispatcher.validateOutgoingFrame(heartbeat).isSuccess)
 
-        // Valid Caller Alert frame (5B 5D 43 ...)
-        val alertFrame = dispatcher.buildCallerAlertFrame(ClusterAlertType.INCOMING_CALL, "RAHUL")
-        assertTrue(dispatcher.validateOutgoingFrame(alertFrame).isSuccess)
+        // 3. Verified Trip Controls (5A F1 00 <subCmd> ... FF)
+        val switchTripA = dispatcher.buildTripControlFrame(IqubeBleSpec.SUBCMD_SWITCH_TRIP_A)
+        val switchTripB = dispatcher.buildTripControlFrame(IqubeBleSpec.SUBCMD_SWITCH_TRIP_B)
+        val resetActive = dispatcher.buildTripControlFrame(IqubeBleSpec.SUBCMD_RESET_ACTIVE_TRIP)
+        assertTrue(dispatcher.validateOutgoingFrame(switchTripA).isSuccess)
+        assertTrue(dispatcher.validateOutgoingFrame(switchTripB).isSuccess)
+        assertTrue(dispatcher.validateOutgoingFrame(resetActive).isSuccess)
+        assertEquals(0xFF.toByte(), switchTripA[19])
+        assertEquals(0xFF.toByte(), switchTripB[19])
+        assertEquals(0xFF.toByte(), resetActive[19])
 
-        // Reject arbitrary unverified header byte
-        val arbitrary = ByteArray(20) { 0x12 }
-        assertTrue(dispatcher.validateOutgoingFrame(arbitrary).isFailure)
+        // 4. Live GPS Location Packet (0x5B 0x5C + up to 17 ASCII chars + Byte 19 = 0xFF)
+        val locationPkt = dispatcher.buildClusterLocationPacket("Sonegaon")
+        assertEquals(20, locationPkt.size)
+        assertEquals(0x5B.toByte(), locationPkt[0])
+        assertEquals(0x5C.toByte(), locationPkt[1])
+        val encodedText = String(locationPkt, 2, 8, StandardCharsets.US_ASCII)
+        assertEquals("Sonegaon", encodedText)
+        assertEquals(0x00.toByte(), locationPkt[10])
+        assertEquals(0xFF.toByte(), locationPkt[19])
+        assertTrue(dispatcher.validateOutgoingFrame(locationPkt).isSuccess)
 
-        // Reject 0x5A frame missing 0xFF terminator at byte 19
-        val missingFooter = tripReset.copyOf().apply { this[19] = 0x00 }
-        assertTrue(dispatcher.validateOutgoingFrame(missingFooter).isFailure)
+        // 5. Incoming Call Cluster Packet ("Rahul Sharma" -> "CALL:Rahul" + 0xFF)
+        val callPkt = dispatcher.buildIncomingCallClusterPacket("Rahul Sharma")
+        val callText = String(callPkt, 2, 10, StandardCharsets.US_ASCII)
+        assertEquals("CALL:Rahul", callText)
+        assertEquals(0xFF.toByte(), callPkt[19])
+        assertTrue(dispatcher.validateOutgoingFrame(callPkt).isSuccess)
+
+        // 6. Reject packet missing 0xFF at Byte 19
+        val missingTrailer = locationPkt.copyOf()
+        missingTrailer[19] = 0x00
+        assertTrue(dispatcher.validateOutgoingFrame(missingTrailer).isFailure)
+    }
+
+    @Test
+    fun chargingPredictorAndTrueRangeEngine_computeAccuratePredictions() {
+        // 1. Tier 1 Default Charging Baseline (2h 45m for 0-80% = 123.75s per 1%)
+        val defaultChg = TrueRangeAndTripRepository.computeChargingMonitorState(
+            isCharging = true,
+            currentBatteryPct = 40,
+            clusterRangeKm = 42.5,
+            sessionStartBatteryPct = 38,
+            liveStepDurationsSec = emptyList(),
+            savedChargingSessions = emptyList()
+        )
+        assertFalse(defaultChg.isUsingLiveStepTiming)
+        assertEquals(123.75, defaultChg.activeSecondsPerPct, 0.01)
+        assertEquals(4950L, defaultChg.remainingSecondsTo80) // (80 - 40) * 123.75 = 4950s
+
+        // 2. Tier 3 Live 1% Step Timing (115.7s per +1% = +31.1%/hr from charging capture)
+        val liveChg = TrueRangeAndTripRepository.computeChargingMonitorState(
+            isCharging = true,
+            currentBatteryPct = 42,
+            clusterRangeKm = 45.0,
+            sessionStartBatteryPct = 38,
+            liveStepDurationsSec = listOf(115.7),
+            savedChargingSessions = emptyList()
+        )
+        assertTrue(liveChg.isUsingLiveStepTiming)
+        assertEquals(115.7, liveChg.activeSecondsPerPct, 0.1)
+        assertEquals(31.1, liveChg.chargingSpeedPctPerHour, 0.1)
+        assertEquals(4397L, liveChg.remainingSecondsTo80) // (80 - 42) * 115.7 = 4396.6 -> 4397s
+
+        // 3. True Range Engine Baseline (1.00 km/% Eco, 0.75 km/% Power) & Learned
+        val baselineRange = TrueRangeAndTripRepository.computeTrueRange(
+            currentBatteryPct = 91,
+            savedTrips = emptyList()
+        )
+        assertEquals(91.0, baselineRange.trueEcoRangeKm ?: 0.0, 0.05)
+        assertEquals(68.3, baselineRange.truePowerRangeKm ?: 0.0, 0.05)
+
+        val sampleTrip = SavedTripRecord(
+            id = "t1",
+            startTimeMs = 1000L,
+            endTimeMs = 2000L,
+            durationSeconds = 600L,
+            startLocationName = "Sonegaon",
+            startLatitude = 21.09,
+            startLongitude = 79.05,
+            endLocationName = "Sitabuldi",
+            endLatitude = 21.14,
+            endLongitude = 79.08,
+            distanceKm = 4.50,
+            startOdometerKm = 35920.7,
+            endOdometerKm = 35925.2,
+            startBatteryPct = 95,
+            endBatteryPct = 90,
+            batteryUsedPct = 5,
+            peakSpeedKmh = 48,
+            avgSpeedKmh = 27.0,
+            rideMode = RideMode.ECO,
+            efficiencyKmPerPct = 0.90,
+            disconnectReason = "Manual"
+        )
+        val learnedRange = TrueRangeAndTripRepository.computeTrueRange(
+            currentBatteryPct = 90,
+            savedTrips = listOf(sampleTrip)
+        )
+        assertTrue(learnedRange.isUsingLearnedEfficiency)
+        assertEquals(81.0, learnedRange.trueEcoRangeKm ?: 0.0, 0.1)
     }
 }
