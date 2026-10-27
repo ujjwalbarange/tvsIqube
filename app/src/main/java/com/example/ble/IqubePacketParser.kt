@@ -21,7 +21,7 @@ import kotlin.math.roundToInt
  *   - `Byte 2` = `uint8` Live Wheel Speed in `km/h` (`d[2]`).
  *   - `Bytes 3..5` = `uint24 Big-Endian` Total Hardware Odometer in `0.1 km` units (`((d[3] << 16) | (d[4] << 8) | d[5]) / 10.0`, e.g., `05 7B 54` = `35,925.2 km`).
  * - `0x5A 0x13` (3.1 Hz):
- *   - `Byte 2` = `uint8` Battery SoC `%` (`d[2]`, e.g., `0x26..0x2A` = `38%..42%`).
+ *   -  `Byte 2` = `uint8` Battery SoC `%` (`d[2]`, e.g., `0x26..0x2A` = `38%..42%`).
  *   - `Bytes 3..4` = `uint16 Big-Endian` Cluster Projected Range in `0.1 km` units (`((d[3] << 8) | d[4]) / 10.0`, e.g., `0x0190` = `40.0 km`, `0x01C2` = `45.0 km`).
  *   - `Byte 5` = State Flag (`0x06` when charging).
  * - `0x5A 0x11` (0.5 Hz):
