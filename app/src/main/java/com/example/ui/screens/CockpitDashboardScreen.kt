@@ -1,5 +1,7 @@
 package com.example.ui.screens
 
+import android.content.Intent
+import android.net.Uri
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.RepeatMode
@@ -35,6 +37,7 @@ import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.Call
 import androidx.compose.material.icons.filled.CallEnd
+import androidx.compose.material.icons.filled.Explore
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.LocationOn
 import androidx.compose.material.icons.filled.Refresh
@@ -63,6 +66,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -70,10 +74,12 @@ import com.example.model.ChargingMonitorState
 import com.example.model.IncomingCallRelayState
 import com.example.model.IqubeBleSpec
 import com.example.model.LastSeenScooterState
+import com.example.model.NavigationManeuverState
 import com.example.model.RideMode
 import com.example.model.TelemetryState
 import com.example.model.TripSubcommandConfig
 import com.example.model.TrueRangeCalculation
+import com.example.model.TurnTypeConstant
 import com.example.ui.theme.AmberWarning
 import com.example.ui.theme.ElectricCyan
 import com.example.ui.theme.EnergeticCoral
@@ -97,6 +103,7 @@ fun CockpitDashboardScreen(
     chargingMonitor: ChargingMonitorState,
     lastSeenState: LastSeenScooterState?,
     incomingCallState: IncomingCallRelayState,
+    navigationState: NavigationManeuverState,
     selectedRangeMode: RideMode,
     detectedLocalityName: String,
     customLocationOverride: String,
@@ -113,6 +120,8 @@ fun CockpitDashboardScreen(
     onSetAutoLocationSync: (Boolean) -> Unit,
     onTriggerIncomingCallClick: (String) -> Unit,
     onEndIncomingCallClick: () -> Unit,
+    onSendNavigationManeuver: (TurnTypeConstant, Int, Byte, String) -> Unit,
+    onToggleNavigationRouteSim: () -> Unit,
     onSimulateChargingStepClick: () -> Unit,
     onToggleChargingClick: () -> Unit,
     modifier: Modifier = Modifier
@@ -186,7 +195,14 @@ fun CockpitDashboardScreen(
                 onResetActiveTripClick = onResetActiveTripClick
             )
 
-            // 5. LIVE CLUSTER LOCATION SYNC CARD (0x5B 0x5C + 17B ASCII Locality Name + 0xFF)
+            // 5. TURN-BY-TURN NAVIGATION 2-PACKET INJECTOR (`0x5B 0x49` -> 400ms -> `0x5B 0x4E`)
+            TurnByTurnNavigationInjectorCard(
+                navigationState = navigationState,
+                onSendManeuver = onSendNavigationManeuver,
+                onToggleRouteSimulation = onToggleNavigationRouteSim
+            )
+
+            // 6. LIVE CLUSTER LOCATION SYNC CARD (0x5B 0x5C + 17B ASCII Locality Name + 0xFF)
             ClusterLocationSyncCard(
                 detectedLocalityName = detectedLocalityName,
                 customLocationOverride = customLocationOverride,
@@ -198,7 +214,7 @@ fun CockpitDashboardScreen(
                 onDumpLocationNowClick = onDumpLocationToClusterClick
             )
 
-            // 6. INCOMING CALL CLUSTER RELAY (1st Name + Call Symbol on 0x5B 0x5C ... 0xFF)
+            // 7. DEDICATED CALLER ID BANNER RELAY (`0x5B 0x43` + 500ms repeat timer)
             IncomingCallClusterRelayCard(
                 incomingCallState = incomingCallState,
                 detectedLocalityName = detectedLocalityName,
@@ -246,7 +262,7 @@ private fun IncomingCallActiveBanner(
                     color = TextPrimary
                 )
                 Text(
-                    text = "Cluster 0x5B 0x5C Locked: \"${incomingCallState.clusterFormattedText}\" + 0xFF (GPS Sync Paused)",
+                    text = "Cluster 0x5B 0x43 Active (500ms repeat timer): \"${incomingCallState.clusterFormattedText}\" + 0xFF",
                     style = MaterialTheme.typography.labelSmall,
                     color = AmberWarning
                 )
@@ -270,6 +286,7 @@ private fun OfflineLastSeenSnapshotCard(
     lastSeen: LastSeenScooterState,
     trueRange: TrueRangeCalculation
 ) {
+    val context = LocalContext.current
     val exactTimeStr = remember(lastSeen.timestampMs) {
         SimpleDateFormat("hh:mm a • dd MMM", Locale.US).format(Date(lastSeen.timestampMs))
     }
@@ -289,7 +306,7 @@ private fun OfflineLastSeenSnapshotCard(
             .border(1.dp, ElectricCyan.copy(alpha = 0.5f), RoundedCornerShape(16.dp))
             .padding(14.dp)
             .testTag("offline_last_seen_card"),
-        verticalArrangement = Arrangement.spacedBy(6.dp)
+        verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -319,17 +336,59 @@ private fun OfflineLastSeenSnapshotCard(
         }
 
         Text(
-            text = "Location: ${lastSeen.locationName}  •  Last SoC: ${lastSeen.batteryPct}%  •  ODO: ${String.format(Locale.US, "%,.1f km", lastSeen.odometerKm)}  •  Cluster Range: ${String.format(Locale.US, "%.1f km", lastSeen.clusterRangeKm)}",
+            text = "Location: ${lastSeen.locationName} (${String.format(Locale.US, "%.4f, %.4f", lastSeen.latitude, lastSeen.longitude)})  •  Last SoC: ${lastSeen.batteryPct}%  •  ODO: ${String.format(Locale.US, "%,.1f km", lastSeen.odometerKm)}  •  Cluster BMS DTE: ${String.format(Locale.US, "%.1f km", lastSeen.clusterRangeKm)}",
             style = MaterialTheme.typography.bodyMedium,
             color = TextPrimary
         )
 
-        Text(
-            text = "Expected True Range at ${lastSeen.batteryPct}%: Eco ${trueRange.trueEcoRangeKm?.let { String.format(Locale.US, "%.1f km", it) } ?: "--"}  |  Power ${trueRange.truePowerRangeKm?.let { String.format(Locale.US, "%.1f km", it) } ?: "--"}",
-            style = MaterialTheme.typography.labelMedium,
-            fontWeight = FontWeight.Bold,
-            color = NeonMint
-        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = "Expected True Range at ${lastSeen.batteryPct}%: Eco ${trueRange.trueEcoRangeKm?.let { String.format(Locale.US, "%.1f km", it) } ?: "--"}  |  Power ${trueRange.truePowerRangeKm?.let { String.format(Locale.US, "%.1f km", it) } ?: "--"}",
+                style = MaterialTheme.typography.labelMedium,
+                fontWeight = FontWeight.Bold,
+                color = NeonMint,
+                modifier = Modifier.weight(1f)
+            )
+            Spacer(modifier = Modifier.width(8.dp))
+            OutlinedButton(
+                onClick = {
+                    try {
+                        val mapsUri = Uri.parse(
+                            String.format(
+                                Locale.US,
+                                "https://www.google.com/maps?q=%.6f,%.6f",
+                                lastSeen.latitude,
+                                lastSeen.longitude
+                            )
+                        )
+                        val intent = Intent(Intent.ACTION_VIEW, mapsUri).apply {
+                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        }
+                        context.startActivity(intent)
+                    } catch (_: Exception) {
+                    }
+                },
+                modifier = Modifier.testTag("find_my_scooter_maps_button")
+            ) {
+                Icon(
+                    imageVector = Icons.Default.LocationOn,
+                    contentDescription = "Find My Scooter on Maps",
+                    tint = ElectricCyan,
+                    modifier = Modifier.size(15.dp)
+                )
+                Spacer(modifier = Modifier.width(4.dp))
+                Text(
+                    text = "Find My Scooter on Maps",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = ElectricCyan,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+        }
     }
 }
 
@@ -486,10 +545,11 @@ private fun HeroBatteryAndTrueRangeCard(
                 Spacer(modifier = Modifier.height(2.dp))
                 Text(
                     text = effectiveClusterRangeKm?.let {
-                        String.format(Locale.US, "CLUSTER (0x13 B3..4): %.1f KM", it)
-                    } ?: "CLUSTER (0x13): --.- KM",
+                        String.format(Locale.US, "Scooter Cluster DTE (BMS Estimate): %.1f km", it)
+                    } ?: "Scooter Cluster DTE (BMS): --.- km",
                     style = MaterialTheme.typography.labelSmall,
-                    color = ElectricCyan
+                    color = ElectricCyan,
+                    modifier = Modifier.testTag("cluster_bms_dte_text")
                 )
             }
         }
@@ -1193,6 +1253,202 @@ private fun ClusterLocationSyncCard(
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun TurnByTurnNavigationInjectorCard(
+    navigationState: NavigationManeuverState,
+    onSendManeuver: (TurnTypeConstant, Int, Byte, String) -> Unit,
+    onToggleRouteSimulation: () -> Unit
+) {
+    var selectedTurn by remember(navigationState.selectedTurn) { mutableStateOf(navigationState.selectedTurn) }
+    var distanceInput by remember(navigationState.distanceMeters) { mutableStateOf(navigationState.distanceMeters.toString()) }
+    var streetInput by remember(navigationState.streetName) { mutableStateOf(navigationState.streetName) }
+    var unitIsKm by remember(navigationState.unitByte) { mutableStateOf(navigationState.unitByte == 0x02) }
+
+    val quickManeuvers = remember {
+        listOf(
+            TurnTypeConstant.TURN_LEFT,
+            TurnTypeConstant.TURN_RIGHT,
+            TurnTypeConstant.CONTINUE_STRAIGHT,
+            TurnTypeConstant.ROUNDABOUT,
+            TurnTypeConstant.U_TURN,
+            TurnTypeConstant.TURN_SHARPLY_RIGHT,
+            TurnTypeConstant.TURN_SLIGHTLY_LEFT,
+            TurnTypeConstant.DESTINATION_REACHED
+        )
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(18.dp))
+            .background(SlateSurface)
+            .border(
+                1.dp,
+                if (navigationState.isRouteSimulationRunning) NeonMint else SlateBorder,
+                RoundedCornerShape(18.dp)
+            )
+            .padding(16.dp)
+            .testTag("navigation_injector_card"),
+        verticalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
+                Icon(
+                    imageVector = Icons.Default.Explore,
+                    contentDescription = "Turn-by-Turn Navigation Injector",
+                    tint = NeonMint,
+                    modifier = Modifier.size(18.dp)
+                )
+                Spacer(modifier = Modifier.width(6.dp))
+                Column {
+                    Text(
+                        text = "TURN-BY-TURN NAVIGATION INJECTOR (0x5B 0x49 → 400ms → 0x5B 0x4E)",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = NeonMint
+                    )
+                    Text(
+                        text = "2-Packet Sequence: Pkt1 [I (TurnCode + uint16 BE Dist + Unit) • 400ms delay • Pkt2 [NNA (15B Street)",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = TextSecondary
+                    )
+                }
+            }
+            OutlinedButton(
+                onClick = onToggleRouteSimulation,
+                modifier = Modifier.testTag("toggle_nav_route_sim_button")
+            ) {
+                Text(
+                    text = if (navigationState.isRouteSimulationRunning) "Stop Route Sim" else "Start Route Sim",
+                    color = if (navigationState.isRouteSimulationRunning) EnergeticCoral else NeonMint,
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+        }
+
+        // Quick Maneuver Chips from TurnTypeConstants.smali
+        FlowRow(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            quickManeuvers.forEach { maneuver ->
+                val isSelected = selectedTurn == maneuver
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(if (isSelected) NeonMint.copy(alpha = 0.22f) else SlateCardElevated)
+                        .border(1.dp, if (isSelected) NeonMint else SlateBorder, RoundedCornerShape(8.dp))
+                        .clickable {
+                            selectedTurn = maneuver
+                            val dist = distanceInput.toIntOrNull() ?: 250
+                            val unit = if (unitIsKm) IqubeBleSpec.NAV_UNIT_KILOMETERS else IqubeBleSpec.NAV_UNIT_METERS
+                            onSendManeuver(maneuver, dist, unit, streetInput)
+                        }
+                        .padding(horizontal = 10.dp, vertical = 6.dp)
+                        .testTag("nav_maneuver_chip_${maneuver.code}")
+                ) {
+                    Text(
+                        text = String.format(Locale.US, "%s %s (0x%02X)", maneuver.symbol, maneuver.title, maneuver.code),
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
+                        color = if (isSelected) NeonMint else TextPrimary
+                    )
+                }
+            }
+        }
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            OutlinedTextField(
+                value = distanceInput,
+                onValueChange = { distanceInput = it.filter { ch -> ch.isDigit() }.take(5) },
+                label = { Text(if (unitIsKm) "Dist (km)" else "Dist (m)") },
+                singleLine = true,
+                modifier = Modifier
+                    .weight(0.9f)
+                    .testTag("nav_distance_input")
+            )
+            OutlinedButton(
+                onClick = { unitIsKm = !unitIsKm },
+                modifier = Modifier.testTag("nav_unit_toggle_button")
+            ) {
+                Text(
+                    text = if (unitIsKm) "0x02 (km)" else "0x01 (m)",
+                    color = ElectricCyan,
+                    style = MaterialTheme.typography.labelSmall
+                )
+            }
+            OutlinedTextField(
+                value = streetInput,
+                onValueChange = { streetInput = it.take(IqubeBleSpec.MAX_NAV_STREET_ASCII_BYTES) },
+                label = { Text("Street / Dest (15B)") },
+                singleLine = true,
+                modifier = Modifier
+                    .weight(1.5f)
+                    .testTag("nav_street_input")
+            )
+        }
+
+        if (!navigationState.lastPacket1Hex.isNullOrBlank() && !navigationState.lastPacket2Hex.isNullOrBlank()) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(SlateCardElevated)
+                    .padding(10.dp)
+            ) {
+                Text(
+                    text = "Pkt 1 (0x5B 0x49): ${navigationState.lastPacket1Hex}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = ElectricCyan
+                )
+                Text(
+                    text = "Pkt 2 (0x5B 0x4E +400ms): ${navigationState.lastPacket2Hex}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = NeonMint
+                )
+            }
+        }
+
+        Button(
+            onClick = {
+                val dist = distanceInput.toIntOrNull() ?: 250
+                val unit = if (unitIsKm) IqubeBleSpec.NAV_UNIT_KILOMETERS else IqubeBleSpec.NAV_UNIT_METERS
+                onSendManeuver(selectedTurn, dist, unit, streetInput)
+            },
+            colors = ButtonDefaults.buttonColors(containerColor = NeonMint, contentColor = SlateSurface),
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag("send_nav_sequence_button")
+        ) {
+            Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send 2-Packet Nav", modifier = Modifier.size(16.dp))
+            Spacer(modifier = Modifier.width(6.dp))
+            Text(
+                text = String.format(
+                    Locale.US,
+                    "Send 2-Packet Nav: %s (0x%02X) • %s%s • \"%s\"",
+                    selectedTurn.title,
+                    selectedTurn.code,
+                    distanceInput.ifBlank { "0" },
+                    if (unitIsKm) "km" else "m",
+                    streetInput.take(15)
+                ),
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = FontWeight.Bold
+            )
+        }
+    }
+}
+
 @Composable
 private fun IncomingCallClusterRelayCard(
     incomingCallState: IncomingCallRelayState,
@@ -1205,7 +1461,7 @@ private fun IncomingCallClusterRelayCard(
         callerInput.trim().split(Regex("\\s+")).firstOrNull()?.replace(Regex("[^\\x20-\\x7E]"), "")?.ifBlank { "Caller" } ?: "Caller"
     }
     val previewClusterText = remember(extractedFirst) {
-        "CALL:$extractedFirst".take(IqubeBleSpec.MAX_LOCATION_ASCII_BYTES)
+        extractedFirst.take(IqubeBleSpec.MAX_LOCATION_ASCII_BYTES)
     }
 
     Column(
@@ -1230,19 +1486,19 @@ private fun IncomingCallClusterRelayCard(
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Icon(
                     imageVector = Icons.Default.Call,
-                    contentDescription = "Incoming Call Cluster Relay",
+                    contentDescription = "Dedicated Caller ID Banner Relay",
                     tint = AmberWarning,
                     modifier = Modifier.size(18.dp)
                 )
                 Spacer(modifier = Modifier.width(6.dp))
                 Column {
                     Text(
-                        text = "INCOMING CALL CLUSTER RELAY (1ST NAME + CALL SYMBOL)",
+                        text = "DEDICATED CALLER ID BANNER (0x5B 0x43 + 500ms REPEAT TIMER)",
                         style = MaterialTheme.typography.labelMedium,
                         color = AmberWarning
                     )
                     Text(
-                        text = "Extracts 1st Name → Pushes [0x5B, 0x5C, \"$previewClusterText\", 0xFF] • Auto-restores \"$detectedLocalityName\" on end",
+                        text = "Sends [0x5B, 0x43, \"$previewClusterText\", 0xFF] + CallState 0x00 (Ringing) every 500ms • Auto-restores \"$detectedLocalityName\" on end",
                         style = MaterialTheme.typography.labelSmall,
                         color = TextSecondary
                     )
@@ -1253,7 +1509,7 @@ private fun IncomingCallClusterRelayCard(
         OutlinedTextField(
             value = callerInput,
             onValueChange = { callerInput = it },
-            label = { Text("Caller Full Name (Extracts 1st Name: '$extractedFirst' → '$previewClusterText')") },
+            label = { Text("Caller Full Name (Extracts 1st Name: '$extractedFirst' → 0x5B 0x43 '$previewClusterText')") },
             singleLine = true,
             modifier = Modifier
                 .fillMaxWidth()
@@ -1274,7 +1530,7 @@ private fun IncomingCallClusterRelayCard(
                 Icon(Icons.Default.Call, contentDescription = "Ring Cluster", modifier = Modifier.size(16.dp))
                 Spacer(modifier = Modifier.width(6.dp))
                 Text(
-                    text = "Ring (\"$previewClusterText\")",
+                    text = "Ring 0x5B 0x43 (\"$previewClusterText\")",
                     style = MaterialTheme.typography.labelLarge,
                     fontWeight = FontWeight.Bold
                 )
@@ -1291,7 +1547,7 @@ private fun IncomingCallClusterRelayCard(
                     Icon(Icons.Default.CallEnd, contentDescription = "End Call", modifier = Modifier.size(16.dp))
                     Spacer(modifier = Modifier.width(6.dp))
                     Text(
-                        text = "End Call (Restore GPS)",
+                        text = "End Call (0x02 & Restore GPS)",
                         style = MaterialTheme.typography.labelLarge,
                         fontWeight = FontWeight.Bold
                     )

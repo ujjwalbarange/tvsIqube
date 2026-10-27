@@ -1,6 +1,7 @@
 package com.example.ui.screens
 
 import android.content.Intent
+import android.net.Uri
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
@@ -22,6 +23,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.LocationOn
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -436,6 +438,65 @@ private fun SavedTripItemCard(
                 color = TextSecondary
             )
         }
+
+        // Go to Start Coordinate & Go to End Coordinate Google Maps Links
+        val context = LocalContext.current
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            OutlinedButton(
+                onClick = { openCoordinatesOnMaps(context, trip.startLatitude, trip.startLongitude) },
+                modifier = Modifier
+                    .weight(1f)
+                    .testTag("trip_start_coord_button_${trip.id}")
+            ) {
+                Icon(
+                    imageVector = Icons.Default.LocationOn,
+                    contentDescription = "Go to Start Coordinate",
+                    tint = ElectricCyan,
+                    modifier = Modifier.size(14.dp)
+                )
+                Spacer(modifier = Modifier.width(4.dp))
+                Text(
+                    text = String.format(Locale.US, "Start (%.4f, %.4f)", trip.startLatitude, trip.startLongitude),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = ElectricCyan
+                )
+            }
+            OutlinedButton(
+                onClick = { openCoordinatesOnMaps(context, trip.endLatitude, trip.endLongitude) },
+                modifier = Modifier
+                    .weight(1f)
+                    .testTag("trip_end_coord_button_${trip.id}")
+            ) {
+                Icon(
+                    imageVector = Icons.Default.LocationOn,
+                    contentDescription = "Go to End Coordinate",
+                    tint = NeonMint,
+                    modifier = Modifier.size(14.dp)
+                )
+                Spacer(modifier = Modifier.width(4.dp))
+                Text(
+                    text = String.format(Locale.US, "End (%.4f, %.4f)", trip.endLatitude, trip.endLongitude),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = NeonMint
+                )
+            }
+        }
+    }
+}
+
+private fun openCoordinatesOnMaps(context: android.content.Context, lat: Double, lon: Double) {
+    try {
+        val mapsUri = Uri.parse(
+            String.format(Locale.US, "https://www.google.com/maps?q=%.6f,%.6f", lat, lon)
+        )
+        val intent = Intent(Intent.ACTION_VIEW, mapsUri).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        context.startActivity(intent)
+    } catch (_: Exception) {
     }
 }
 

@@ -4,11 +4,10 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.ExperimentalLayoutApi
-import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -16,6 +15,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -32,7 +32,6 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -40,6 +39,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.example.model.BleConnectionPhase
 import com.example.model.RideMode
@@ -53,7 +53,6 @@ import com.example.ui.theme.SlateSurface
 import com.example.ui.theme.TextPrimary
 import com.example.ui.theme.TextSecondary
 
-@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun TopConnectionHeader(
     connectionPhase: BleConnectionPhase,
@@ -86,39 +85,48 @@ fun TopConnectionHeader(
     }
 
     val statusLabel = when (connectionPhase) {
-        BleConnectionPhase.DISCONNECTED -> "OFFLINE (LAST SEEN)"
-        BleConnectionPhase.SCANNING -> "SCANNING TVSiQUBE…"
-        BleConnectionPhase.CONNECTING_GATT -> "CONNECTING GATT…"
-        BleConnectionPhase.DISCOVERING_SERVICES -> "SERVICE 5456534d…"
-        BleConnectionPhase.ENABLING_CCCD -> "CCCD 0x001F (0x5354)…"
-        BleConnectionPhase.NEGOTIATING_MTU -> "EXCHANGING MTU 247…"
-        BleConnectionPhase.SENDING_HANDSHAKE -> "HANDSHAKE [RU 0xFF…"
-        BleConnectionPhase.STREAMING_ACTIVE -> if (isCharging) "BLE CHARGING (0x5354)" else "BLE CONNECTED"
-        BleConnectionPhase.REPLAYING_RIDING_LOG -> "RIDE CAPTURE (btsnooz)"
-        BleConnectionPhase.REPLAYING_CHARGING_LOG -> "CHARGE CAPTURE (38→42%)"
-        BleConnectionPhase.RECONNECTING_BACKOFF -> "AUTO-RECONNECTING…"
+        BleConnectionPhase.DISCONNECTED -> "OFFLINE"
+        BleConnectionPhase.SCANNING -> "SCANNING…"
+        BleConnectionPhase.CONNECTING_GATT -> "CONNECTING…"
+        BleConnectionPhase.DISCOVERING_SERVICES -> "SERVICES…"
+        BleConnectionPhase.ENABLING_CCCD -> "CCCD 0x5354…"
+        BleConnectionPhase.NEGOTIATING_MTU -> "MTU ${negotiatedMtu ?: 247}…"
+        BleConnectionPhase.SENDING_HANDSHAKE -> "HANDSHAKE…"
+        BleConnectionPhase.STREAMING_ACTIVE -> if (isCharging) "CHARGING" else "CONNECTED"
+        BleConnectionPhase.REPLAYING_RIDING_LOG -> "RIDE REPLAY"
+        BleConnectionPhase.REPLAYING_CHARGING_LOG -> "CHARGE REPLAY"
+        BleConnectionPhase.RECONNECTING_BACKOFF -> "RECONNECTING…"
     }
 
     Column(
         modifier = modifier
             .fillMaxWidth()
             .background(SlateSurface)
-            .border(width = 1.dp, color = SlateBorder, shape = RoundedCornerShape(bottomStart = 16.dp, bottomEnd = 16.dp))
-            .padding(horizontal = 16.dp, vertical = 12.dp)
+            .border(
+                width = 1.dp,
+                color = SlateBorder,
+                shape = RoundedCornerShape(bottomStart = 14.dp, bottomEnd = 14.dp)
+            )
+            .padding(horizontal = 12.dp, vertical = 8.dp)
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            // Left: Scooter Identity (from 0x5A 0x7D "TVSiQUBEJI573") & MAC
-            Row(verticalAlignment = Alignment.CenterVertically) {
+            // Left: Scooter Identity (from 0x5A 0x7D "TVSiQUBEJI573") & MAC — weighted so it never crushes the right pill
+            Row(
+                modifier = Modifier
+                    .weight(1f)
+                    .padding(end = 8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
                 Box(
                     modifier = Modifier
-                        .size(38.dp)
-                        .clip(RoundedCornerShape(10.dp))
+                        .size(32.dp)
+                        .clip(RoundedCornerShape(8.dp))
                         .background(statusDotColor.copy(alpha = 0.14f))
-                        .border(1.dp, statusDotColor.copy(alpha = 0.45f), RoundedCornerShape(10.dp)),
+                        .border(1.dp, statusDotColor.copy(alpha = 0.45f), RoundedCornerShape(8.dp)),
                     contentAlignment = Alignment.Center
                 ) {
                     Icon(
@@ -129,82 +137,89 @@ fun TopConnectionHeader(
                         },
                         contentDescription = "BLE Connection Status",
                         tint = statusDotColor,
-                        modifier = Modifier.size(20.dp)
+                        modifier = Modifier.size(18.dp)
                     )
                 }
-                Spacer(modifier = Modifier.width(10.dp))
-                Column {
+                Spacer(modifier = Modifier.width(8.dp))
+                Column(modifier = Modifier.weight(1f)) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text(
                             text = deviceName,
-                            style = MaterialTheme.typography.titleMedium,
+                            style = MaterialTheme.typography.titleSmall,
                             fontWeight = FontWeight.Bold,
                             color = TextPrimary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
                             modifier = Modifier.testTag("header_vehicle_id_text")
                         )
-                        Spacer(modifier = Modifier.width(6.dp))
+                        Spacer(modifier = Modifier.width(5.dp))
                         val lockIcon = if (isIgnitionUnlocked == true) Icons.Default.LockOpen else Icons.Default.Lock
                         val lockTint = if (isIgnitionUnlocked == true) NeonMint else TextSecondary
                         Icon(
                             imageVector = lockIcon,
                             contentDescription = if (isIgnitionUnlocked == true) "Ignition Unlocked" else "Ignition Locked",
                             tint = lockTint,
-                            modifier = Modifier.size(14.dp)
+                            modifier = Modifier.size(13.dp)
                         )
                     }
                     Text(
-                        text = "$deviceMac • ${rssiDbm?.let { "$it dBm" } ?: "-- dBm"} • ST:0x5354 SR:0x5352",
+                        text = "$deviceMac • ${rssiDbm?.let { "$it dBm" } ?: "-- dBm"} • 0x5354/0x5352",
                         style = MaterialTheme.typography.labelSmall,
-                        color = TextSecondary
+                        color = TextSecondary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
                     )
                 }
             }
 
-            // Right: Connection Status Pill
+            // Right: Single-line Connection Status Pill
             Row(
                 modifier = Modifier
-                    .clip(RoundedCornerShape(20.dp))
+                    .clip(RoundedCornerShape(16.dp))
                     .background(SlateCardElevated)
-                    .border(1.dp, statusDotColor.copy(alpha = 0.5f), RoundedCornerShape(20.dp))
-                    .padding(horizontal = 10.dp, vertical = 5.dp),
+                    .border(1.dp, statusDotColor.copy(alpha = 0.5f), RoundedCornerShape(16.dp))
+                    .padding(horizontal = 10.dp, vertical = 4.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Box(
                     modifier = Modifier
-                        .size(8.dp)
+                        .size(7.dp)
                         .clip(CircleShape)
                         .background(statusDotColor)
                 )
-                Spacer(modifier = Modifier.width(6.dp))
+                Spacer(modifier = Modifier.width(5.dp))
                 Text(
                     text = statusLabel,
                     style = MaterialTheme.typography.labelSmall,
                     fontWeight = FontWeight.Bold,
-                    color = statusDotColor
+                    color = statusDotColor,
+                    maxLines = 1
                 )
             }
         }
 
-        Spacer(modifier = Modifier.height(10.dp))
+        Spacer(modifier = Modifier.height(6.dp))
 
-        // Action Bar: Scan BLE, Ride Replay (btsnooz_hci.log), Charge Replay (btsnoop_hci.log), Ride/Charge Mode badge
-        FlowRow(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp)
+        // Compact single-line scrollable Action Bar: Scan BLE, Ride Replay, Charge Replay, Mode badge
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalAlignment = Alignment.CenterVertically
         ) {
             if (connectionPhase == BleConnectionPhase.DISCONNECTED ||
                 connectionPhase == BleConnectionPhase.RECONNECTING_BACKOFF
             ) {
                 HeaderActionButton(
-                    label = "Scan BLE (TVSiQUBE)",
+                    label = "Scan BLE",
                     icon = Icons.Default.Bluetooth,
                     accentColor = NeonMint,
                     testTag = "connect_ble_button",
                     onClick = onConnectBleClick
                 )
                 HeaderActionButton(
-                    label = "Ride Replay (91%)",
+                    label = "Ride Replay (96%)",
                     icon = Icons.Default.PlayArrow,
                     accentColor = ElectricCyan,
                     testTag = "replay_hci_button",
@@ -219,7 +234,7 @@ fun TopConnectionHeader(
                 )
             } else {
                 HeaderActionButton(
-                    label = if (connectionPhase == BleConnectionPhase.STREAMING_ACTIVE) "Disconnect BLE" else "Stop Replay",
+                    label = if (connectionPhase == BleConnectionPhase.STREAMING_ACTIVE) "Disconnect" else "Stop Replay",
                     icon = Icons.Default.Stop,
                     accentColor = EnergeticCoral,
                     testTag = "disconnect_ble_button",
@@ -236,7 +251,7 @@ fun TopConnectionHeader(
                 }
                 if (connectionPhase != BleConnectionPhase.REPLAYING_CHARGING_LOG) {
                     HeaderActionButton(
-                        label = "Charge Replay (38→42%)",
+                        label = "Charge Replay",
                         icon = Icons.Default.Bolt,
                         accentColor = AmberWarning,
                         testTag = "switch_to_charging_replay_button",
@@ -246,7 +261,7 @@ fun TopConnectionHeader(
             }
 
             // Live State Badge (Charging 0x06/0x01 vs Ride Mode)
-            val modeText = if (isCharging) "CHARGING (0x06 / 0x01)" else (rideMode?.label ?: "ECO MODE")
+            val modeText = if (isCharging) "CHARGING" else (rideMode?.label ?: "ECO MODE")
             val modeColor = when {
                 isCharging -> NeonMint
                 rideMode == RideMode.POWER -> EnergeticCoral
@@ -255,18 +270,18 @@ fun TopConnectionHeader(
             }
             Box(
                 modifier = Modifier
-                    .height(36.dp)
-                    .clip(RoundedCornerShape(10.dp))
+                    .clip(RoundedCornerShape(8.dp))
                     .background(SlateCardElevated)
-                    .border(1.dp, modeColor.copy(alpha = 0.4f), RoundedCornerShape(10.dp))
-                    .padding(horizontal = 12.dp),
+                    .border(1.dp, modeColor.copy(alpha = 0.4f), RoundedCornerShape(8.dp))
+                    .padding(horizontal = 9.dp, vertical = 5.dp),
                 contentAlignment = Alignment.Center
             ) {
                 Text(
                     text = modeText,
-                    style = MaterialTheme.typography.labelMedium,
+                    style = MaterialTheme.typography.labelSmall,
                     fontWeight = FontWeight.Bold,
-                    color = modeColor
+                    color = modeColor,
+                    maxLines = 1
                 )
             }
         }
@@ -276,8 +291,8 @@ fun TopConnectionHeader(
             Surface(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(top = 8.dp),
-                shape = RoundedCornerShape(10.dp),
+                    .padding(top = 6.dp),
+                shape = RoundedCornerShape(8.dp),
                 color = if (isLinkDegraded) EnergeticCoral.copy(alpha = 0.16f) else AmberWarning.copy(alpha = 0.14f)
             ) {
                 Row(
@@ -286,22 +301,24 @@ fun TopConnectionHeader(
                         .border(
                             1.dp,
                             if (isLinkDegraded) EnergeticCoral.copy(alpha = 0.5f) else AmberWarning.copy(alpha = 0.4f),
-                            RoundedCornerShape(10.dp)
+                            RoundedCornerShape(8.dp)
                         )
-                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                        .padding(horizontal = 10.dp, vertical = 6.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Icon(
                         imageVector = Icons.Default.Warning,
                         contentDescription = "Link Warning",
                         tint = if (isLinkDegraded) EnergeticCoral else AmberWarning,
-                        modifier = Modifier.size(16.dp)
+                        modifier = Modifier.size(14.dp)
                     )
-                    Spacer(modifier = Modifier.width(8.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
                     Text(
                         text = linkWarningMessage.orEmpty(),
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = TextPrimary
+                        style = MaterialTheme.typography.labelSmall,
+                        color = TextPrimary,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
                     )
                 }
             }
@@ -319,12 +336,11 @@ private fun HeaderActionButton(
 ) {
     Row(
         modifier = Modifier
-            .minimumInteractiveComponentSize()
-            .clip(RoundedCornerShape(10.dp))
+            .clip(RoundedCornerShape(8.dp))
             .background(accentColor.copy(alpha = 0.15f))
-            .border(1.dp, accentColor.copy(alpha = 0.55f), RoundedCornerShape(10.dp))
+            .border(1.dp, accentColor.copy(alpha = 0.55f), RoundedCornerShape(8.dp))
             .clickable(onClick = onClick)
-            .padding(horizontal = 12.dp, vertical = 8.dp)
+            .padding(horizontal = 10.dp, vertical = 5.dp)
             .testTag(testTag),
         verticalAlignment = Alignment.CenterVertically
     ) {
@@ -332,14 +348,15 @@ private fun HeaderActionButton(
             imageVector = icon,
             contentDescription = label,
             tint = accentColor,
-            modifier = Modifier.size(16.dp)
+            modifier = Modifier.size(14.dp)
         )
-        Spacer(modifier = Modifier.width(6.dp))
+        Spacer(modifier = Modifier.width(5.dp))
         Text(
             text = label,
-            style = MaterialTheme.typography.labelLarge,
+            style = MaterialTheme.typography.labelSmall,
             fontWeight = FontWeight.Bold,
-            color = accentColor
+            color = accentColor,
+            maxLines = 1
         )
     }
 }

@@ -302,13 +302,14 @@ class IqubePacketParser {
         val derivedVolts = ((44.8f + (socPercent / 100f) * 8.4f) * 10f).roundToInt() / 10f
 
         _telemetryState.update { prev ->
-            val combinedCharging = isCharging0x06 || (prev.chargingFlag0x11Byte5 == 0x01)
+            // Strict Charging State Logic:
+            // If frameType === 0x13 && d[5] === 0x06 -> true; if d[5] !== 0x06 -> immediately false
             prev.copy(
                 batteryPercent = socPercent,
                 clusterRangeKm = clusterRangeKm,
                 stateFlag0x13Byte5 = stateFlagByte5,
-                isCharging = combinedCharging,
-                rideMode = if (combinedCharging) RideMode.CHARGING else (prev.rideMode ?: RideMode.ECO),
+                isCharging = isCharging0x06,
+                rideMode = if (isCharging0x06) RideMode.CHARGING else (if (prev.rideMode == RideMode.CHARGING) RideMode.ECO else (prev.rideMode ?: RideMode.ECO)),
                 packVoltageVolts = derivedVolts,
                 latestFrame0x13 = frame.copyOf(),
                 packetCount0x13 = if (incrementCounter) prev.packetCount0x13 + 1 else prev.packetCount0x13,
@@ -351,15 +352,16 @@ class IqubePacketParser {
         val tripBKm = readUInt24BE(frame, tripBIdx) / 10.0
 
         _telemetryState.update { prev ->
-            val combinedCharging = isCharging0x01 || (prev.stateFlag0x13Byte5 == 0x06)
+            // Strict Charging State Logic:
+            // If frameType === 0x11 && d[5] === 0x01 -> true; if d[5] === 0x00 -> immediately false
             prev.copy(
                 tripAKm = tripAKm,
                 tripBKm = tripBKm,
                 chargingFlag0x11Byte5 = chargingFlagByte5,
                 socMirror0x11 = socMirror,
                 batteryPercent = prev.batteryPercent ?: (if (socMirror > 0) socMirror else null),
-                isCharging = combinedCharging,
-                rideMode = if (combinedCharging) RideMode.CHARGING else (prev.rideMode ?: RideMode.ECO),
+                isCharging = isCharging0x01,
+                rideMode = if (isCharging0x01) RideMode.CHARGING else (if (prev.rideMode == RideMode.CHARGING) RideMode.ECO else (prev.rideMode ?: RideMode.ECO)),
                 lastOdometerSyncMs = timestampMs,
                 latestFrame0x11 = frame.copyOf(),
                 packetCount0x11 = if (incrementCounter) prev.packetCount0x11 + 1 else prev.packetCount0x11,

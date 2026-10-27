@@ -7,6 +7,7 @@ import com.example.ble.TrueRangeAndTripRepository
 import com.example.model.IqubeBleSpec
 import com.example.model.RideMode
 import com.example.model.SavedTripRecord
+import com.example.model.TurnTypeConstant
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import org.junit.Assert.assertEquals
@@ -57,6 +58,18 @@ class ExampleUnitTest {
         assertEquals(0x06, stateAfter13.stateFlag0x13Byte5)
         assertTrue(stateAfter13.isCharging)
 
+        // Strict Charging State Rule: Non-charging 0x13 frame (Byte 5 != 0x06) immediately clears isCharging
+        parser.ingestRawChunk(
+            HciLogReplayDataset.buildBatteryRangeFrame0x13(
+                socPercent = 96,
+                clusterRangeTenthsKm = 1010, // 0x03F2 = 101.0 km
+                isCharging = false
+            ),
+            1500L
+        )
+        assertFalse(parser.telemetryState.value.isCharging)
+        assertEquals(101.0, parser.telemetryState.value.clusterRangeKm ?: 0.0, 0.01)
+
         // 2. 0x5A 0x10 Speed + uint24 BE Total Hardware Odometer (Bytes 3..5 = 05 7B 54 = 359,252 = 35,925.2 km)
         parser.ingestRawChunk(HciLogReplayDataset.buildSpeedOdometerFrame0x10(0, 359252), 2000L)
         parser.ingestRawChunk(HciLogReplayDataset.buildSpeedOdometerFrame0x10(15, 359252), 3000L)
@@ -96,7 +109,7 @@ class ExampleUnitTest {
     }
 
     @Test
-    fun commandDispatcher_enforcesMandatory0xFFTrailerOnAllOutgoingPackets() {
+    fun commandDispatcher_enforcesMandatory0xFFTrailerAndSmaliPacketStructures() {
         val dispatcher = IqubeCommandDispatcher(
             scope = CoroutineScope(Dispatchers.Unconfined),
             performGattWrite = { true },
@@ -115,13 +128,17 @@ class ExampleUnitTest {
         assertEquals(0xFF.toByte(), heartbeat[19])
         assertTrue(dispatcher.validateOutgoingFrame(heartbeat).isSuccess)
 
-        // 3. Verified Trip Controls (5A F1 00 <subCmd> ... FF)
+        // 3. Verified Trip Controls (createVehicleDataArray: 0x00=Trip A, 0x01=Trip B, 0x02=Reset)
         val switchTripA = dispatcher.buildTripControlFrame(IqubeBleSpec.SUBCMD_SWITCH_TRIP_A)
         val switchTripB = dispatcher.buildTripControlFrame(IqubeBleSpec.SUBCMD_SWITCH_TRIP_B)
         val resetActive = dispatcher.buildTripControlFrame(IqubeBleSpec.SUBCMD_RESET_ACTIVE_TRIP)
         assertTrue(dispatcher.validateOutgoingFrame(switchTripA).isSuccess)
         assertTrue(dispatcher.validateOutgoingFrame(switchTripB).isSuccess)
         assertTrue(dispatcher.validateOutgoingFrame(resetActive).isSuccess)
+        assertEquals(0x00.toByte(), switchTripA[3])
+        assertEquals(0x00.toByte(), switchTripA[12])
+        assertEquals(0x02.toByte(), switchTripA[5])
+        assertEquals(0x01.toByte(), switchTripA[14])
         assertEquals(0xFF.toByte(), switchTripA[19])
         assertEquals(0xFF.toByte(), switchTripB[19])
         assertEquals(0xFF.toByte(), resetActive[19])
@@ -137,14 +154,44 @@ class ExampleUnitTest {
         assertEquals(0xFF.toByte(), locationPkt[19])
         assertTrue(dispatcher.validateOutgoingFrame(locationPkt).isSuccess)
 
-        // 5. Incoming Call Cluster Packet ("Rahul Sharma" -> "CALL:Rahul" + 0xFF)
-        val callPkt = dispatcher.buildIncomingCallClusterPacket("Rahul Sharma")
-        val callText = String(callPkt, 2, 10, StandardCharsets.US_ASCII)
-        assertEquals("CALL:Rahul", callText)
+        // 5. Dedicated Caller ID Packet (0x5B 0x43 + "Rahul" + 0xFF) & Call State (0x5B 0x5D 0x43 0x00 ... 0xFF)
+        val callPkt = dispatcher.buildCallerPacket0x43("Rahul Sharma")
+        assertEquals(0x5B.toByte(), callPkt[0])
+        assertEquals(0x43.toByte(), callPkt[1])
+        val callText = String(callPkt, 2, 5, StandardCharsets.US_ASCII)
+        assertEquals("Rahul", callText)
         assertEquals(0xFF.toByte(), callPkt[19])
         assertTrue(dispatcher.validateOutgoingFrame(callPkt).isSuccess)
 
-        // 6. Reject packet missing 0xFF at Byte 19
+        val callStatePkt = dispatcher.buildCallStatePacket(IqubeBleSpec.CALL_STATE_RINGING)
+        assertEquals(0x5B.toByte(), callStatePkt[0])
+        assertEquals(0x5D.toByte(), callStatePkt[1])
+        assertEquals(0x43.toByte(), callStatePkt[2])
+        assertEquals(0x00.toByte(), callStatePkt[3])
+        assertEquals(0xFF.toByte(), callStatePkt[19])
+        assertTrue(dispatcher.validateOutgoingFrame(callStatePkt).isSuccess)
+
+        // 6. Turn-by-Turn Navigation 2-Packet Sequence (0x5B 0x49 + 0x5B 0x4E)
+        val navPkt1 = dispatcher.buildNavigationManeuverPacket1(TurnTypeConstant.TURN_RIGHT.code, 250, 0x01)
+        assertEquals(0x5B.toByte(), navPkt1[0])
+        assertEquals(0x49.toByte(), navPkt1[1])
+        assertEquals(0x03.toByte(), navPkt1[2]) // Turn Right = 0x03 in TurnTypeConstants.smali
+        assertEquals(0x00.toByte(), navPkt1[3])
+        assertEquals(250.toByte(), navPkt1[4])
+        assertEquals(0x01.toByte(), navPkt1[5])
+        assertEquals(0xFF.toByte(), navPkt1[19])
+        assertTrue(dispatcher.validateOutgoingFrame(navPkt1).isSuccess)
+
+        val navPkt2 = dispatcher.buildNavigationStreetPacket2(TurnTypeConstant.TURN_RIGHT.code, "MG Road")
+        assertEquals(0x5B.toByte(), navPkt2[0])
+        assertEquals(0x4E.toByte(), navPkt2[1])
+        assertEquals(0x4E.toByte(), navPkt2[2]) // 'N'
+        assertEquals(0x41.toByte(), navPkt2[3]) // 'A'
+        assertEquals("MG Road", String(navPkt2, 4, 7, StandardCharsets.US_ASCII))
+        assertEquals(0xFF.toByte(), navPkt2[19])
+        assertTrue(dispatcher.validateOutgoingFrame(navPkt2).isSuccess)
+
+        // 7. Reject packet missing 0xFF at Byte 19
         val missingTrailer = locationPkt.copyOf()
         missingTrailer[19] = 0x00
         assertTrue(dispatcher.validateOutgoingFrame(missingTrailer).isFailure)

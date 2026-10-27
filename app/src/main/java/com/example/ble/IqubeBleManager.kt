@@ -27,11 +27,14 @@ import com.example.model.IncomingCallRelayState
 import com.example.model.IqubeBleSpec
 import com.example.model.LastParkedLocation
 import com.example.model.LastSeenScooterState
+import com.example.model.NavigationManeuverState
 import com.example.model.RideMode
 import com.example.model.SavedChargingSession
 import com.example.model.SavedTripRecord
 import com.example.model.TripSubcommandConfig
 import com.example.model.TrueRangeCalculation
+import com.example.model.TurnTypeConstant
+import com.example.model.toHexString
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -53,7 +56,7 @@ import kotlin.math.roundToInt
 
 /**
  * Full Lifecycle BLE GATT, Unfiltered 20-Byte Telemetry Controller, Live Charging Predictor,
- * Incoming Call Cluster Relay, Offline Last-Seen Tracker & Trip Logger for TVS iQube (`F8:55:48:72:96:DA`).
+ * Turn-by-Turn Navigation Injector, Incoming Call Cluster Relay (`0x5B 0x43`), Offline Last-Seen Tracker & Trip Logger.
  */
 class IqubeBleManager(
     private val context: Context,
@@ -78,6 +81,9 @@ class IqubeBleManager(
     private var watchdogJob: Job? = null
     private var reconnectJob: Job? = null
     private var callAutoClearJob: Job? = null
+    private var callerRepeatJob: Job? = null
+    private var navSequenceJob: Job? = null
+    private var navigationSimJob: Job? = null
     private var reconnectAttemptCount = 0
 
     // Connection & Link StateFlows
@@ -131,9 +137,13 @@ class IqubeBleManager(
     private val _lastSyncedClusterLocation = MutableStateFlow<String?>(null)
     val lastSyncedClusterLocation: StateFlow<String?> = _lastSyncedClusterLocation.asStateFlow()
 
-    // Incoming Call Relay State (`1st Name + Call Symbol` on `0x5B 0x5C ... 0xFF`)
+    // Incoming Call Relay State (`1st Name` on `0x5B 0x43 ... 0xFF` + 500ms repeat timer)
     private val _incomingCallState = MutableStateFlow(IncomingCallRelayState())
     val incomingCallState: StateFlow<IncomingCallRelayState> = _incomingCallState.asStateFlow()
+
+    // Turn-by-Turn Navigation Injector State (`0x5B 0x49` -> 400ms -> `0x5B 0x4E`)
+    private val _navigationState = MutableStateFlow(NavigationManeuverState())
+    val navigationState: StateFlow<NavigationManeuverState> = _navigationState.asStateFlow()
 
     // Active Connect-to-Disconnect Trip Session
     private val _activeTripSession = MutableStateFlow<ActiveTripSession?>(null)
@@ -155,8 +165,8 @@ class IqubeBleManager(
     private var replayTripATenths = HciLogReplayDataset.CHARGING_CAPTURE_TRIP_A_TENTHS_KM // 0.3 km
     private var replayTripBTenths = HciLogReplayDataset.CHARGING_CAPTURE_TRIP_B_TENTHS_KM // 1.0 km
     private var replayOdoTenths = HciLogReplayDataset.CHARGING_CAPTURE_ODO_TENTHS_KM      // 359252 = 35,925.2 km
-    private var replayBatterySoc = 91
-    private var replayClusterRangeTenths = 960 // 96.0 km
+    private var replayBatterySoc = 96
+    private var replayClusterRangeTenths = 1010 // 101.0 km (0x03F2 at 96% SoC)
     private var replayCharging = false
 
     // GPS + BLE Ride Logger & Last Parked State
@@ -279,6 +289,7 @@ class IqubeBleManager(
 
                 // 3. Persist Last Seen Scooter State on telemetry updates
                 if (tele.batteryPercent != null && tele.odometerKm != null) {
+                    val loc = _lastKnownLocation.value
                     tripRepository.saveLastSeenState(
                         LastSeenScooterState(
                             timestampMs = now,
@@ -288,6 +299,8 @@ class IqubeBleManager(
                             tripAKm = tele.tripAKm ?: 0.3,
                             tripBKm = tele.tripBKm ?: 1.0,
                             locationName = _detectedLocalityName.value.ifBlank { "Sonegaon" },
+                            latitude = loc?.latitude ?: 21.0922,
+                            longitude = loc?.longitude ?: 79.0560,
                             wasCharging = tele.isCharging,
                             vehicleId = tele.vehicleIdString ?: IqubeBleSpec.CLUSTER_VEHICLE_ID_DEFAULT
                         )
@@ -398,14 +411,15 @@ class IqubeBleManager(
     }
 
     /**
-     * Incoming Call Cluster Relay (`1st Name + Call Symbol` on `0x5B 0x5C ... 0xFF` & `0x5B 0x5D 0x43 ... 0xFF`).
-     * Extracts the caller's first name, pauses background GPS location dumps while ringing,
-     * and pushes `"CALL:<FirstName>"` onto the scooter cluster.
+     * Dedicated Caller ID Banner (`0x5B 0x43` / `DATA_ID_CALLER_43` & `0x5B 0x5D 0x43`).
+     * Extracts caller's 1st Name (e.g. `"Rahul"` from `"Rahul Sharma"`), sends `callState = 0x00` (Ringing)
+     * and `[0x5B, 0x43, ...utf8(firstName), ...0x00, 0xFF]`, and starts a 500 ms periodic repeat timer
+     * (`iQubeCallerDataSendTimer`) while ringing so background GPS location writes never overwrite it.
      */
     fun triggerIncomingCallAlert(fullCallerName: String) {
         val cleaned = fullCallerName.trim().ifBlank { "Rahul Sharma" }
         val firstName = cleaned.split(Regex("\\s+")).firstOrNull()?.replace(Regex("[^\\x20-\\x7E]"), "")?.ifBlank { "Caller" } ?: "Caller"
-        val clusterCallText = "CALL:$firstName".take(IqubeBleSpec.MAX_LOCATION_ASCII_BYTES)
+        val clusterCallText = firstName.take(IqubeBleSpec.MAX_LOCATION_ASCII_BYTES)
 
         _incomingCallState.value = IncomingCallRelayState(
             isRinging = true,
@@ -414,18 +428,33 @@ class IqubeBleManager(
             clusterFormattedText = clusterCallText,
             ringStartTimeMs = System.currentTimeMillis()
         )
-        _lastSyncedClusterLocation.value = clusterCallText
+        _lastSyncedClusterLocation.value = "CALL:$clusterCallText"
 
-        // 1. Push 0x5B 0x5C location override with Call Symbol + 1st Name
+        // 1. Send Call State Ringing (`0x5B 0x5D 0x43 0x00 ... 0xFF`)
         commandDispatcher.enqueueCommand(
-            label = "Incoming Call [\\$clusterCallText",
-            rawPayload = commandDispatcher.buildIncomingCallClusterPacket(cleaned)
+            label = "Call State Ringing (5B 5D 43 00 … FF)",
+            rawPayload = commandDispatcher.buildCallStatePacket(IqubeBleSpec.CALL_STATE_RINGING)
         )
-        // 2. Also push 0x5B 0x5D 0x43 ([]C) caller notification frame
+        // 2. Send Dedicated Caller ID Frame (`0x5B 0x43 <17B firstName> 0xFF`)
+        val callerPayload = commandDispatcher.buildCallerPacket0x43(cleaned)
         commandDispatcher.enqueueCommand(
-            label = "Caller Alert []C ($firstName)",
-            rawPayload = commandDispatcher.buildCallerAlertFrame0x5D(firstName)
+            label = "Caller ID [C $clusterCallText (5B 43 … FF)",
+            rawPayload = callerPayload
         )
+
+        // 3. Run 500 ms periodic timer (`iQubeCallerDataSendTimer`) while ringing
+        callerRepeatJob?.cancel()
+        callerRepeatJob = scope.launch {
+            while (isActive && _incomingCallState.value.isRinging) {
+                delay(IqubeBleSpec.CALLER_REPEAT_TIMER_MS)
+                if (_incomingCallState.value.isRinging && commandDispatcher.queueDepth.value <= 2) {
+                    commandDispatcher.enqueueCommand(
+                        label = "Caller Repeat 500ms [C $clusterCallText",
+                        rawPayload = commandDispatcher.buildCallerPacket0x43(cleaned)
+                    )
+                }
+            }
+        }
 
         // Auto-clear after 15 seconds if not manually ended, restoring live GPS locality
         callAutoClearJob?.cancel()
@@ -438,16 +467,108 @@ class IqubeBleManager(
     }
 
     /**
-     * Ends the active incoming call alert and immediately restores the live GPS locality
-     * (e.g. `"Sonegaon"`) onto the scooter cluster (`0x5B 0x5C ... 0xFF`).
+     * Ends the active incoming call alert, cancels the 500 ms `iQubeCallerDataSendTimer`,
+     * sends `callState = 0x02` (`Ended`), and immediately restores the live GPS locality (`0x5B 0x5C ... 0xFF`).
      */
-    fun endIncomingCallAlert() {
+    fun endIncomingCallAlert(callStateByte: Byte = IqubeBleSpec.CALL_STATE_ENDED) {
+        callerRepeatJob?.cancel()
         callAutoClearJob?.cancel()
         val prev = _incomingCallState.value
         _incomingCallState.value = prev.copy(isRinging = false)
+        commandDispatcher.enqueueCommand(
+            label = "Call State Ended (5B 5D 43 02 … FF)",
+            rawPayload = commandDispatcher.buildCallStatePacket(callStateByte)
+        )
         if (isActivelyConnectedOrReplaying()) {
             dumpLocationToClusterNow()
         }
+    }
+
+    /**
+     * Turn-by-Turn Navigation 2-Packet Sequence (`sendNavigationData` from `ConnectionManager.smali`):
+     * 1. Packet 1 (`0x5B 0x49`): Maneuver icon (`TurnTypeConstants.smali` `0x00..0x48`), uint16 BE distance, & unit (`0x01`=m, `0x02`=km).
+     * 2. Pause `400 ms` (`0x190` ms).
+     * 3. Packet 2 (`0x5B 0x4E`): `"NA"` (`0x4E 0x41`) + 15-byte street name (or `0x00 0x00` + destination if `turnCode == 0x08`).
+     */
+    fun sendNavigationData(
+        turn: TurnTypeConstant,
+        distanceMeters: Int,
+        unitByte: Byte = IqubeBleSpec.NAV_UNIT_METERS,
+        streetName: String
+    ) {
+        val cleanStreet = streetName.trim().ifBlank { "MG Road" }.take(IqubeBleSpec.MAX_NAV_STREET_ASCII_BYTES)
+        val clampedDist = distanceMeters.coerceIn(0, 65535)
+        val unitInt = unitByte.toInt() and 0xFF
+        val pkt1 = commandDispatcher.buildNavigationManeuverPacket1(turn.code, clampedDist, unitInt)
+        val pkt2 = commandDispatcher.buildNavigationStreetPacket2(turn.code, cleanStreet)
+
+        _navigationState.update {
+            it.copy(
+                selectedTurn = turn,
+                distanceMeters = clampedDist,
+                unitByte = unitInt,
+                streetName = cleanStreet,
+                lastPacket1Hex = pkt1.toHexString(),
+                lastPacket2Hex = pkt2.toHexString(),
+                lastSentTimestampMs = System.currentTimeMillis()
+            )
+        }
+
+        navSequenceJob?.cancel()
+        navSequenceJob = scope.launch {
+            commandDispatcher.enqueueCommand(
+                label = String.format("Nav Pkt1 [I %s (%dm)", turn.title, clampedDist),
+                rawPayload = pkt1
+            )
+            delay(IqubeBleSpec.NAVIGATION_INTER_PACKET_DELAY_MS) // 400 ms (0x190 ms)
+            commandDispatcher.enqueueCommand(
+                label = "Nav Pkt2 [NNA $cleanStreet",
+                rawPayload = pkt2
+            )
+        }
+    }
+
+    /**
+     * Toggles a multi-step Turn-by-Turn Navigation route simulation that streams live distance
+     * countdowns and maneuver transitions onto the cluster.
+     */
+    fun toggleNavigationRouteSimulation() {
+        if (_navigationState.value.isRouteSimulationRunning) {
+            stopNavigationRouteSimulation()
+            return
+        }
+        _navigationState.update { it.copy(isRouteSimulationRunning = true) }
+        navigationSimJob?.cancel()
+        navigationSimJob = scope.launch {
+            data class SimStep(val turn: TurnTypeConstant, val distMeters: Int, val street: String)
+            val routeSteps = listOf(
+                SimStep(TurnTypeConstant.TURN_RIGHT, 250, "MG Road"),
+                SimStep(TurnTypeConstant.TURN_RIGHT, 120, "MG Road"),
+                SimStep(TurnTypeConstant.TURN_RIGHT, 40, "MG Road"),
+                SimStep(TurnTypeConstant.ROUNDABOUT, 300, "Wardha Rd"),
+                SimStep(TurnTypeConstant.ROUNDABOUT, 100, "Wardha Rd"),
+                SimStep(TurnTypeConstant.TURN_LEFT, 180, "Sonegaon Rd"),
+                SimStep(TurnTypeConstant.TURN_LEFT, 50, "Sonegaon Rd"),
+                SimStep(TurnTypeConstant.DESTINATION_REACHED, 0, "Sonegaon Hub")
+            )
+            var idx = 0
+            while (isActive && _navigationState.value.isRouteSimulationRunning) {
+                val step = routeSteps[idx % routeSteps.size]
+                sendNavigationData(
+                    turn = step.turn,
+                    distanceMeters = step.distMeters,
+                    unitByte = IqubeBleSpec.NAV_UNIT_METERS,
+                    streetName = step.street
+                )
+                idx++
+                delay(2600L)
+            }
+        }
+    }
+
+    fun stopNavigationRouteSimulation() {
+        navigationSimJob?.cancel()
+        _navigationState.update { it.copy(isRouteSimulationRunning = false) }
     }
 
     /**
@@ -798,8 +919,8 @@ class IqubeBleManager(
             replayOdoTenths = HciLogReplayDataset.CHARGING_CAPTURE_ODO_TENTHS_KM // 359252 = 35,925.2 km
             replayTripATenths = HciLogReplayDataset.CHARGING_CAPTURE_TRIP_A_TENTHS_KM // 3 = 0.3 km
             replayTripBTenths = HciLogReplayDataset.CHARGING_CAPTURE_TRIP_B_TENTHS_KM // 10 = 1.0 km
-            replayBatterySoc = 91
-            replayClusterRangeTenths = 960 // 96.0 km
+            replayBatterySoc = 96
+            replayClusterRangeTenths = 1010 // 101.0 km (0x03F2 BMS DTE at 96% SoC)
             replayCharging = false
 
             _connectionPhase.value = BleConnectionPhase.ENABLING_CCCD
@@ -851,9 +972,9 @@ class IqubeBleManager(
 
                     // 2. 0x5A 0x13 Battery SoC + Cluster Range + 0x5A 0x7D Vehicle ID (3.1 Hz)
                     if (tick % 2 == 0) {
-                        if (tick >= 45 && replayBatterySoc == 91) {
-                            replayBatterySoc = 90
-                            replayClusterRangeTenths = 950
+                        if (tick >= 45 && replayBatterySoc == 96) {
+                            replayBatterySoc = 95
+                            replayClusterRangeTenths = 1000
                         }
                         feedFrameToParser(
                             HciLogReplayDataset.buildBatteryRangeFrame0x13(
@@ -1372,6 +1493,8 @@ class IqubeBleManager(
                         tripAKm = tele.tripAKm ?: 0.3,
                         tripBKm = tele.tripBKm ?: 1.0,
                         locationName = locality,
+                        latitude = lat,
+                        longitude = lon,
                         wasCharging = tele.isCharging,
                         vehicleId = tele.vehicleIdString ?: IqubeBleSpec.CLUSTER_VEHICLE_ID_DEFAULT
                     )
@@ -1386,6 +1509,8 @@ class IqubeBleManager(
         heartbeatJob?.cancel()
         locationSyncJob?.cancel()
         watchdogJob?.cancel()
+        callerRepeatJob?.cancel()
+        stopNavigationRouteSimulation()
     }
 
     fun disconnectBle(userInitiated: Boolean = true) {

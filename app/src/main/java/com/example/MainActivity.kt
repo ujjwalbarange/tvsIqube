@@ -97,6 +97,7 @@ fun IqubeCompanionApp(
     val chargingMonitor by viewModel.chargingMonitorState.collectAsStateWithLifecycle()
     val lastSeenState by viewModel.lastSeenState.collectAsStateWithLifecycle()
     val incomingCallState by viewModel.incomingCallState.collectAsStateWithLifecycle()
+    val navigationState by viewModel.navigationState.collectAsStateWithLifecycle()
     val selectedRangeMode by viewModel.selectedRangeMode.collectAsStateWithLifecycle()
     val savedTrips by viewModel.savedTrips.collectAsStateWithLifecycle()
     val activeTripSession by viewModel.activeTripSession.collectAsStateWithLifecycle()
@@ -197,6 +198,7 @@ fun IqubeCompanionApp(
                                     chargingMonitor = chargingMonitor,
                                     lastSeenState = lastSeenState,
                                     incomingCallState = incomingCallState,
+                                    navigationState = navigationState,
                                     selectedRangeMode = selectedRangeMode,
                                     detectedLocalityName = detectedLocalityName,
                                     customLocationOverride = customLocationOverride,
@@ -212,7 +214,9 @@ fun IqubeCompanionApp(
                                     onCustomLocationOverrideChange = viewModel::setCustomLocationOverride,
                                     onSetAutoLocationSync = viewModel::setAutoLocationSyncEnabled,
                                     onTriggerIncomingCallClick = viewModel::triggerIncomingCallAlert,
-                                    onEndIncomingCallClick = viewModel::endIncomingCallAlert,
+                                    onEndIncomingCallClick = { viewModel.endIncomingCallAlert() },
+                                    onSendNavigationManeuver = viewModel::sendNavigationManeuver,
+                                    onToggleNavigationRouteSim = viewModel::toggleNavigationRouteSimulation,
                                     onSimulateChargingStepClick = viewModel::simulateLiveOnePercentChargingStep,
                                     onToggleChargingClick = viewModel::toggleReplayChargingState
                                 )

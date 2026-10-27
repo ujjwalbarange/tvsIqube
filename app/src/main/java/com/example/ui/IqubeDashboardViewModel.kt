@@ -9,14 +9,17 @@ import com.example.model.ByteOffsetMapping
 import com.example.model.ChargingMonitorState
 import com.example.model.GpsBleFusionSample
 import com.example.model.IncomingCallRelayState
+import com.example.model.IqubeBleSpec
 import com.example.model.LastParkedLocation
 import com.example.model.LastSeenScooterState
+import com.example.model.NavigationManeuverState
 import com.example.model.QueuedWriteCommand
 import com.example.model.RideMode
 import com.example.model.SavedTripRecord
 import com.example.model.TelemetryState
 import com.example.model.TripSubcommandConfig
 import com.example.model.TrueRangeCalculation
+import com.example.model.TurnTypeConstant
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -53,11 +56,12 @@ class IqubeDashboardViewModel(application: Application) : AndroidViewModel(appli
     val byteOffsetMapping: StateFlow<ByteOffsetMapping> = bleManager.packetParser.byteOffsetMapping
     val tripSubcommandConfig: StateFlow<TripSubcommandConfig> = bleManager.tripSubcommandConfig
 
-    // True Range, Charging Monitor, Last Seen State & Trip History StateFlows
+    // True Range, Charging Monitor, Last Seen State, Navigation & Trip History StateFlows
     val trueRangeState: StateFlow<TrueRangeCalculation> = bleManager.trueRangeState
     val chargingMonitorState: StateFlow<ChargingMonitorState> = bleManager.chargingMonitorState
     val lastSeenState: StateFlow<LastSeenScooterState?> = bleManager.lastSeenState
     val incomingCallState: StateFlow<IncomingCallRelayState> = bleManager.incomingCallState
+    val navigationState: StateFlow<NavigationManeuverState> = bleManager.navigationState
     val selectedRangeMode: StateFlow<RideMode> = bleManager.selectedRangeMode
     val savedTrips: StateFlow<List<SavedTripRecord>> = bleManager.tripRepository.savedTrips
     val activeTripSession: StateFlow<ActiveTripSession?> = bleManager.activeTripSession
@@ -128,13 +132,27 @@ class IqubeDashboardViewModel(application: Application) : AndroidViewModel(appli
         bleManager.setAutoLocationSyncEnabled(enabled)
     }
 
-    // Incoming Call Relay (`1st Name + Call Symbol` on `0x5B 0x5C ... 0xFF`)
+    // Dedicated Caller ID Banner (`0x5B 0x43` + 500ms repeat timer)
     fun triggerIncomingCallAlert(fullCallerName: String) {
         bleManager.triggerIncomingCallAlert(fullCallerName)
     }
 
     fun endIncomingCallAlert() {
         bleManager.endIncomingCallAlert()
+    }
+
+    // Turn-by-Turn Navigation Injector (`0x5B 0x49` -> 400ms -> `0x5B 0x4E`)
+    fun sendNavigationManeuver(
+        turn: TurnTypeConstant,
+        distanceMeters: Int,
+        unitByte: Byte = IqubeBleSpec.NAV_UNIT_METERS,
+        streetName: String
+    ) {
+        bleManager.sendNavigationData(turn, distanceMeters, unitByte, streetName)
+    }
+
+    fun toggleNavigationRouteSimulation() {
+        bleManager.toggleNavigationRouteSimulation()
     }
 
     // Charging Predictor Actions

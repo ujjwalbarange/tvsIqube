@@ -55,7 +55,10 @@ class TrueRangeAndTripRepository(private val context: Context?) {
             activeTripStartBatteryPct: Int? = null,
             activeTripMode: RideMode = RideMode.ECO
         ): TrueRangeCalculation {
-            val qualifyingTrips = savedTrips.filter { it.batteryUsedPct >= 1 && it.distanceKm > 0.0 }
+            // Rolling 3-Trip window where distanceKm >= 1.0 && batteryUsedPct >= 1
+            val qualifyingTrips = savedTrips
+                .filter { it.distanceKm >= 1.0 && it.batteryUsedPct >= 1 }
+                .take(3)
             var histEcoEquivKm = 0.0
             var histBatteryPct = 0
 
@@ -96,13 +99,13 @@ class TrueRangeAndTripRepository(private val context: Context?) {
                 powerKmPerPct = IqubeBleSpec.DEFAULT_POWER_KM_PER_PCT // 0.75 km / 1%
                 sourceLabel = "Default Baseline (Eco 1.00 km/% • Power 0.75 km/%)"
             } else {
-                val rawEcoRate = (totalEcoEquivKm / totalBatteryPctUsed.toDouble()).coerceIn(0.45, 1.45)
+                val rawEcoRate = (totalEcoEquivKm / totalBatteryPctUsed.toDouble()).coerceIn(0.60, 1.50)
                 ecoKmPerPct = (rawEcoRate * 100.0).roundToInt() / 100.0
                 powerKmPerPct = ((ecoKmPerPct * IqubeBleSpec.POWER_TO_ECO_RATIO) * 100.0).roundToInt() / 100.0
                 val tripCount = qualifyingTrips.size + (if (currEcoEquivKm > 0.0) 1 else 0)
                 sourceLabel = String.format(
                     Locale.US,
-                    "Learned from %d Trip(s) (%.2f km / %d%% used)",
+                    "Rolling %d-Trip + Live Efficiency (%.2f km / %d%% used)",
                     tripCount,
                     totalRawKm,
                     totalBatteryPctUsed
@@ -552,6 +555,8 @@ class TrueRangeAndTripRepository(private val context: Context?) {
                 tripAKm = obj.optDouble("tripAKm", 0.3),
                 tripBKm = obj.optDouble("tripBKm", 1.0),
                 locationName = obj.optString("locationName", "Sonegaon"),
+                latitude = obj.optDouble("latitude", 21.0922),
+                longitude = obj.optDouble("longitude", 79.0560),
                 wasCharging = obj.optBoolean("wasCharging", false),
                 vehicleId = obj.optString("vehicleId", IqubeBleSpec.CLUSTER_VEHICLE_ID_DEFAULT)
             )
@@ -569,6 +574,8 @@ class TrueRangeAndTripRepository(private val context: Context?) {
             put("tripAKm", state.tripAKm)
             put("tripBKm", state.tripBKm)
             put("locationName", state.locationName)
+            put("latitude", state.latitude)
+            put("longitude", state.longitude)
             put("wasCharging", state.wasCharging)
             put("vehicleId", state.vehicleId)
         }
