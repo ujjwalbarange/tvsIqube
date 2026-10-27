@@ -64,6 +64,7 @@ object IqubeBleSpec {
     // Charging State Constants
     const val FLAG_0X13_CHARGING_MODE: Byte = 0x06
     const val FLAG_0X11_CHARGING_ACTIVE: Byte = 0x01
+    const val CHARGING_DEBOUNCE_FRAMES = 3           // 3-frame hysteresis debounce before latching charging = true
     const val VERIFIED_CAPTURE_SEC_PER_PCT = 115.7   // +31.1% / hr from btsnoop_hci.log charging capture
     const val DEFAULT_0_TO_80_SEC_PER_PCT = 123.75   // 2 hr 45 min (9,900s) for 0% -> 80%
     const val DEFAULT_80_TO_100_SEC_PER_PCT = 180.0  // 3 min (180s) per 1% taper for 80% -> 100%
