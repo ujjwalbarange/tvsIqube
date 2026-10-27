@@ -167,18 +167,24 @@ class TrueRangeAndTripRepository(private val context: Context?) {
             val activeSecPerPct = liveMeasuredSecPerPct ?: baselineSecPerPct
             val pctPerHour = ((3600.0 / activeSecPerPct) * 10.0).roundToInt() / 10.0
 
+            val taperSecPerPct = IqubeBleSpec.DEFAULT_80_TO_100_SEC_PER_PCT // 180.0s per 1% (80->100%)
+
             val remSecTo80 = currentBatteryPct?.let { soc ->
                 (max(0, 80 - soc) * activeSecPerPct).roundToLong()
             }
             val remSecTo100 = currentBatteryPct?.let { soc ->
-                (max(0, 100 - soc) * activeSecPerPct).roundToLong()
+                val pctTo80 = max(0, 80 - soc)
+                val pct80To100 = if (soc < 80) 20 else max(0, 100 - soc)
+                (pctTo80 * activeSecPerPct + pct80To100 * taperSecPerPct).roundToLong()
             }
 
             val baselineRemSecTo80 = currentBatteryPct?.let { soc ->
                 (max(0, 80 - soc) * baselineSecPerPct).roundToLong()
             }
             val baselineRemSecTo100 = currentBatteryPct?.let { soc ->
-                (max(0, 100 - soc) * baselineSecPerPct).roundToLong()
+                val pctTo80 = max(0, 80 - soc)
+                val pct80To100 = if (soc < 80) 20 else max(0, 100 - soc)
+                (pctTo80 * baselineSecPerPct + pct80To100 * taperSecPerPct).roundToLong()
             }
 
             val pctGained = if (sessionStartBatteryPct != null && currentBatteryPct != null) {
@@ -198,7 +204,7 @@ class TrueRangeAndTripRepository(private val context: Context?) {
                     baselineSecPerPct,
                     qualifyingHistory.size
                 )
-                else -> "Default Baseline (2h 45m 0–80% = 123.8s/% • Capture Ref: 115.7s/%)"
+                else -> "Default Baseline (2h 45m 0–80% = 123.8s/% • 80–100% = 180s/%)"
             }
 
             return ChargingMonitorState(
@@ -232,6 +238,15 @@ class TrueRangeAndTripRepository(private val context: Context?) {
 
     private val _lastSeenState = MutableStateFlow<LastSeenScooterState?>(loadLastSeenStateFromStorage())
     val lastSeenState: StateFlow<LastSeenScooterState?> = _lastSeenState.asStateFlow()
+
+    fun loadRiderName(): String {
+        return prefs?.getString("rider_greeting_name_v1", "Rider")?.ifBlank { "Rider" } ?: "Rider"
+    }
+
+    fun saveRiderName(name: String) {
+        val cleaned = name.replace(Regex("[^\\x20-\\x7E]"), "").trim().ifEmpty { "Rider" }.take(IqubeBleSpec.MAX_LOCATION_ASCII_BYTES)
+        prefs?.edit()?.putString("rider_greeting_name_v1", cleaned)?.apply()
+    }
 
     fun saveCompletedTrip(trip: SavedTripRecord) {
         val updated = listOf(trip) + _savedTrips.value

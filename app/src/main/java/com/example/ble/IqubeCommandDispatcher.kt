@@ -87,27 +87,30 @@ class IqubeCommandDispatcher(
         }
 
         // Case B: 0x5B ('[') SmartXonnect frame:
-        // - [RU (0x5B, 0x52, 0x55): Initial Handshake
-        // - [JD (0x5B, 0x4A, 0x44): Periodic Clock Sync Heartbeat
+        // - [RU (0x5B, 0x52, 0x55): Initial Handshake & Phone Battery/Signal Relay
+        // - [R  (0x5B, 0x52, ...17B UTF-8, 0xFF): Rider Greeting ("Hello <Rider Name>")
+        // - [JD (0x5B, 0x4A, 0x44): Periodic Clock & Date Sync Heartbeat
         // - [\  (0x5B, 0x5C, ...17B ASCII, 0xFF): GPS Locality Text
         // - [C  (0x5B, 0x43, ...17B ASCII, 0xFF): Dedicated Caller ID Banner (DATA_ID_CALLER_43)
         // - []C (0x5B, 0x5D, 0x43, callState, ..., 0xFF): Call State (writeCallStateForIQube)
-        // - [I  (0x5B, 0x49, turnCode, distHi, distLo, unit, ..., 0xFF): Navigation Maneuver & Distance
+        // - [I  (0x5B, 0x49, turnCode, distHi, distLo, unit, etaHr, etaMin, ..., 0xFF): Navigation Maneuver & Distance
         // - [N  (0x5B, 0x4E, ..., 0xFF): Navigation Assist Street Name / Destination Reached
+        // - [b  (0x5B, 0x62, ...17B UTF-8, 0xFF): Music Track Title Banner (SONG_NAME_PACKET)
         if (b0 == IqubeBleSpec.HEADER_ASCII_CMD) {
-            val isHandshake = b1 == IqubeBleSpec.DATA_ID_HANDSHAKE_52 && b2 == 0x55.toByte() // [RU
+            val isRiderOrStatus52 = b1 == IqubeBleSpec.DATA_ID_HANDSHAKE_52                  // [RU or [R <riderName>
             val isHeartbeat = b1 == IqubeBleSpec.DATA_ID_HEARTBEAT_4A && b2 == 0x44.toByte() // [JD
             val isLocation = b1 == IqubeBleSpec.DATA_ID_LOCATION_5C                          // [\
             val isCaller43 = b1 == IqubeBleSpec.DATA_ID_CALLER_43                            // [C (0x5B 0x43)
             val isCallState5D = b1 == IqubeBleSpec.DATA_ID_CALL_STATE_5D && b2 == 0x43.toByte() // []C
             val isNavManeuver49 = b1 == IqubeBleSpec.DATA_ID_NAV_MANEUVER_49                 // [I (0x5B 0x49)
             val isNavAssist4E = b1 == IqubeBleSpec.DATA_ID_NAV_ASSIST_4E                     // [N (0x5B 0x4E)
+            val isMusicTrack62 = b1 == IqubeBleSpec.SONG_NAME_PACKET                         // [b (0x5B 0x62)
 
-            if (isHandshake || isHeartbeat || isLocation || isCaller43 || isCallState5D || isNavManeuver49 || isNavAssist4E) {
+            if (isRiderOrStatus52 || isHeartbeat || isLocation || isCaller43 || isCallState5D || isNavManeuver49 || isNavAssist4E || isMusicTrack62) {
                 return Result.success(payload.copyOf())
             }
             return Result.failure(
-                IllegalArgumentException("Unrecognized 0x5B header. Allowed: [RU, [JD, [\\ (5B 5C), [C (5B 43), []C (5B 5D 43), [I (5B 49), or [N (5B 4E).")
+                IllegalArgumentException("Unrecognized 0x5B header. Allowed: [RU/[R (5B 52), [JD (5B 4A 44), [\\ (5B 5C), [C (5B 43), []C (5B 5D 43), [I (5B 49), [N (5B 4E), or [b (5B 62).")
             )
         }
 
@@ -117,7 +120,7 @@ class IqubeCommandDispatcher(
     }
 
     /**
-     * 1. Initial Session Handshake (`[RU`):
+     * 1A. Initial Session Handshake (`[RU`):
      *    `[0x5B, 0x52, 0x55, 0x01, ...ascii("IQUBE_OSS"), ...0x00, 0xFF]`
      */
     fun buildInitialHandshakeFrame(riderAlias: String = "IQUBE_OSS"): ByteArray {
@@ -134,22 +137,42 @@ class IqubeCommandDispatcher(
     }
 
     /**
-     * 2. Periodic Clock Sync Heartbeat (`[JD`, every 1.8s):
-     *    `[0x5B, 0x4A, 0x44, hours, minutes, seconds, 0x01, 0, ..., 0, 0xFF]`
+     * 1B. Phone Battery & Network Status Bar Relay (`0x5B 0x52 0x55` / `buildPhoneStatusPacket`):
+     *     `[0x5B, 0x52, 0x55, batteryPct, signalBars, 0x01, 0, ..., 0, 0xFF]`
      */
-    fun buildHeartbeatSyncFrame(): ByteArray {
-        val cal = Calendar.getInstance()
-        val frame = ByteArray(IqubeBleSpec.STANDARD_FRAME_SIZE)
-        frame[0] = 0x5B // '['
-        frame[1] = 0x4A // 'J'
-        frame[2] = 0x44 // 'D'
-        frame[3] = cal.get(Calendar.HOUR_OF_DAY).toByte()
-        frame[4] = cal.get(Calendar.MINUTE).toByte()
-        frame[5] = cal.get(Calendar.SECOND).toByte()
-        frame[6] = 0x01
-        frame[19] = IqubeBleSpec.FOOTER_DELIMITER // 0xFF
-        return frame
+    fun buildPhoneStatusPacket(batteryPct: Int = 85, signalBars: Int = 4): ByteArray {
+        val p = ByteArray(IqubeBleSpec.STANDARD_FRAME_SIZE)
+        p[0] = 0x5B // '['
+        p[1] = 0x52 // 'R'
+        p[2] = 0x55 // 'U'
+        p[3] = (batteryPct.coerceIn(0, 100) and 0xFF).toByte() // Phone battery %
+        p[4] = (signalBars.coerceIn(0, 4) and 0xFF).toByte()   // Cellular signal bars (0..4)
+        p[5] = 0x01                                            // Bluetooth connected indicator
+        p[19] = IqubeBleSpec.FOOTER_DELIMITER                  // 0xFF
+        return p
     }
+
+    /**
+     * 2. Clock & Date Synchronization (`0x5B 0x4A 0x44` — `buildClockSyncPacket` / `buildHeartbeatSyncFrame`):
+     *    `[0x5B, 0x4A, 0x44, hours, minutes, seconds, 0x01, day, month, year%100, 0, ..., 0, 0xFF]`
+     */
+    fun buildClockSyncPacket(cal: Calendar = Calendar.getInstance()): ByteArray {
+        val p = ByteArray(IqubeBleSpec.STANDARD_FRAME_SIZE)
+        p[0] = 0x5B // '['
+        p[1] = 0x4A // 'J'
+        p[2] = 0x44 // 'D'
+        p[3] = (cal.get(Calendar.HOUR_OF_DAY) and 0xFF).toByte()   // Hours (0..23)
+        p[4] = (cal.get(Calendar.MINUTE) and 0xFF).toByte()        // Minutes (0..59)
+        p[5] = (cal.get(Calendar.SECOND) and 0xFF).toByte()        // Seconds (0..59)
+        p[6] = 0x01                                                // Active sync flag
+        p[7] = (cal.get(Calendar.DAY_OF_MONTH) and 0xFF).toByte()  // Day (1..31)
+        p[8] = ((cal.get(Calendar.MONTH) + 1) and 0xFF).toByte()   // Month (1..12)
+        p[9] = ((cal.get(Calendar.YEAR) % 100) and 0xFF).toByte()  // 2-digit Year
+        p[19] = IqubeBleSpec.FOOTER_DELIMITER                      // 0xFF
+        return p
+    }
+
+    fun buildHeartbeatSyncFrame(): ByteArray = buildClockSyncPacket()
 
     /**
      * 3. Live GPS Locality Text (`0x5B 0x5C` / `createLocationDataArray`):
@@ -242,22 +265,39 @@ class IqubeCommandDispatcher(
     }
 
     /**
-     * 6A. Turn-by-Turn Navigation Packet 1 (Maneuver & Distance Frame — `0x5B 0x49`):
-     *     `[0x5B, 0x49, turnCode, (distMeters >> 8) & 0xFF, distMeters & 0xFF, unitByte (0x01=m, 0x02=km), 0x00..., 0xFF]`
+     * 6A. Turn-by-Turn Navigation Packet 1 (Maneuver, Distance & ETA Frame — `0x5B 0x49`):
+     *     - `p[2] = turnCode` (`0x00..0x48` from `TurnTypeConstants.smali`)
+     *     - Automatic `m` (`0x01`) vs `0.1 km` (`0x02`) scaling when `unitByte == 0x01 && distanceValue >= 1000`
+     *     - `p[6] = (etaMinutes / 60)` (ETA hours), `p[7] = (etaMinutes % 60)` (ETA minutes)
+     *     - `p[19] = 0xFF`
      */
     fun buildNavigationManeuverPacket1(
         turnCode: Int,
         distanceValue: Int,
-        unitByte: Int = 0x01 // 0x01 = meters, 0x02 = km
+        unitByte: Int = 0x01, // 0x01 = meters, 0x02 = 0.1 km tenths
+        etaMinutes: Int = 12
     ): ByteArray {
         val p = ByteArray(IqubeBleSpec.STANDARD_FRAME_SIZE)
-        val clampedDist = distanceValue.coerceIn(0, 65535)
         p[0] = 0x5B // '['
         p[1] = IqubeBleSpec.DATA_ID_NAV_MANEUVER_49 // 0x49 ('I')
         p[2] = (turnCode and 0xFF).toByte()
-        p[3] = ((clampedDist shr 8) and 0xFF).toByte()
-        p[4] = (clampedDist and 0xFF).toByte()
-        p[5] = (unitByte and 0xFF).toByte()
+
+        val rawDist = max(0, distanceValue)
+        if ((unitByte and 0xFF) == 0x01 && rawDist >= 1000) {
+            val tenthsKm = kotlin.math.round(rawDist / 100.0).toInt().coerceIn(0, 65535)
+            p[3] = ((tenthsKm shr 8) and 0xFF).toByte()
+            p[4] = (tenthsKm and 0xFF).toByte()
+            p[5] = 0x02 // Unit: Kilometers (0.1 km resolution)
+        } else {
+            val clampedDist = rawDist.coerceIn(0, 65535)
+            p[3] = ((clampedDist shr 8) and 0xFF).toByte()
+            p[4] = (clampedDist and 0xFF).toByte()
+            p[5] = (unitByte and 0xFF).toByte()
+        }
+
+        val safeEta = max(0, etaMinutes)
+        p[6] = ((safeEta / 60) and 0xFF).toByte() // ETA Hours
+        p[7] = ((safeEta % 60) and 0xFF).toByte() // ETA Minutes
         p[19] = IqubeBleSpec.FOOTER_DELIMITER // 0xFF mandatory trailer
         return p
     }
@@ -291,6 +331,43 @@ class IqubeCommandDispatcher(
             .take(IqubeBleSpec.MAX_NAV_STREET_ASCII_BYTES)
         val streetBytes = cleanStreet.toByteArray(StandardCharsets.UTF_8)
         System.arraycopy(streetBytes, 0, p, 4, minOf(streetBytes.size, IqubeBleSpec.MAX_NAV_STREET_ASCII_BYTES))
+        p[19] = IqubeBleSpec.FOOTER_DELIMITER // 0xFF mandatory trailer
+        return p
+    }
+
+    /**
+     * 7. Music Track Title Banner (`SONG_NAME_PACKET = 0x62` / `0x5B 0x62` — `buildMusicTrackPacket`):
+     *    `[0x5B, 0x62, ...utf8(songTitle.slice(0, 17)), ...0x00, 0xFF]`
+     */
+    fun buildMusicTrackPacket(songTitle: String): ByteArray {
+        val p = ByteArray(IqubeBleSpec.STANDARD_FRAME_SIZE)
+        p[0] = 0x5B // '['
+        p[1] = IqubeBleSpec.SONG_NAME_PACKET // 0x62 ('b')
+        val cleanSong = songTitle
+            .replace(Regex("[^\\x20-\\x7E]"), "")
+            .trim()
+            .take(IqubeBleSpec.MAX_LOCATION_ASCII_BYTES)
+        val bytes = cleanSong.toByteArray(StandardCharsets.UTF_8)
+        System.arraycopy(bytes, 0, p, 2, minOf(bytes.size, IqubeBleSpec.MAX_LOCATION_ASCII_BYTES))
+        p[19] = IqubeBleSpec.FOOTER_DELIMITER // 0xFF mandatory trailer
+        return p
+    }
+
+    /**
+     * 8. Editable Rider Greeting Name (`createRiderNameArray` / `0x5B 0x52` — `buildRiderNamePacket`):
+     *    `[0x5B, 0x52, ...utf8(riderName.slice(0, 17)), ...0x00, 0xFF]` ("Hello <Rider Name>")
+     */
+    fun buildRiderNamePacket(riderName: String): ByteArray {
+        val p = ByteArray(IqubeBleSpec.STANDARD_FRAME_SIZE)
+        p[0] = 0x5B // '['
+        p[1] = IqubeBleSpec.DATA_ID_HANDSHAKE_52 // 0x52 ('R')
+        val cleanRider = riderName
+            .replace(Regex("[^\\x20-\\x7E]"), "")
+            .trim()
+            .ifEmpty { "Rider" }
+            .take(IqubeBleSpec.MAX_LOCATION_ASCII_BYTES)
+        val bytes = cleanRider.toByteArray(StandardCharsets.UTF_8)
+        System.arraycopy(bytes, 0, p, 2, minOf(bytes.size, IqubeBleSpec.MAX_LOCATION_ASCII_BYTES))
         p[19] = IqubeBleSpec.FOOTER_DELIMITER // 0xFF mandatory trailer
         return p
     }

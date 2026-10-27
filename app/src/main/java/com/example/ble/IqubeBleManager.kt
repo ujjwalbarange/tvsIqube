@@ -17,6 +17,7 @@ import android.content.Context
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
+import android.os.BatteryManager
 import android.os.Build
 import android.os.Looper
 import com.example.model.ActiveTripSession
@@ -144,6 +145,13 @@ class IqubeBleManager(
     // Turn-by-Turn Navigation Injector State (`0x5B 0x49` -> 400ms -> `0x5B 0x4E`)
     private val _navigationState = MutableStateFlow(NavigationManeuverState())
     val navigationState: StateFlow<NavigationManeuverState> = _navigationState.asStateFlow()
+
+    // Rider Greeting Name (`0x5B 0x52`) & Music Track Title (`0x5B 0x62`)
+    private val _riderGreetingName = MutableStateFlow(tripRepository.loadRiderName())
+    val riderGreetingName: StateFlow<String> = _riderGreetingName.asStateFlow()
+
+    private val _musicTrackTitle = MutableStateFlow("Midnight City")
+    val musicTrackTitle: StateFlow<String> = _musicTrackTitle.asStateFlow()
 
     // Active Connect-to-Disconnect Trip Session
     private val _activeTripSession = MutableStateFlow<ActiveTripSession?>(null)
@@ -494,19 +502,21 @@ class IqubeBleManager(
         turn: TurnTypeConstant,
         distanceMeters: Int,
         unitByte: Byte = IqubeBleSpec.NAV_UNIT_METERS,
-        streetName: String
+        streetName: String,
+        etaMinutes: Int = _navigationState.value.etaMinutes
     ) {
         val cleanStreet = streetName.trim().ifBlank { "MG Road" }.take(IqubeBleSpec.MAX_NAV_STREET_ASCII_BYTES)
         val clampedDist = distanceMeters.coerceIn(0, 65535)
         val unitInt = unitByte.toInt() and 0xFF
-        val pkt1 = commandDispatcher.buildNavigationManeuverPacket1(turn.code, clampedDist, unitInt)
+        val pkt1 = commandDispatcher.buildNavigationManeuverPacket1(turn.code, clampedDist, unitInt, etaMinutes)
         val pkt2 = commandDispatcher.buildNavigationStreetPacket2(turn.code, cleanStreet)
 
         _navigationState.update {
             it.copy(
                 selectedTurn = turn,
                 distanceMeters = clampedDist,
-                unitByte = unitInt,
+                unitByte = pkt1[5].toInt() and 0xFF,
+                etaMinutes = etaMinutes,
                 streetName = cleanStreet,
                 lastPacket1Hex = pkt1.toHexString(),
                 lastPacket2Hex = pkt2.toHexString(),
@@ -1310,6 +1320,43 @@ class IqubeBleManager(
         commandDispatcher.enqueueCommand(
             label = "Cluster Location [\\$effectiveLocation (0xFF)",
             rawPayload = payload
+        )
+    }
+
+    fun readPhoneBatteryPercent(): Int {
+        return try {
+            val bm = context.getSystemService(Context.BATTERY_SERVICE) as? BatteryManager
+            val pct = bm?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY) ?: 85
+            if (pct in 1..100) pct else 85
+        } catch (_: Exception) {
+            85
+        }
+    }
+
+    fun sendPhoneStatusRelayNow(signalBars: Int = 4) {
+        val batteryPct = readPhoneBatteryPercent()
+        commandDispatcher.enqueueCommand(
+            label = "Phone Status [RU (${batteryPct}% • ${signalBars} bars)",
+            rawPayload = commandDispatcher.buildPhoneStatusPacket(batteryPct, signalBars)
+        )
+    }
+
+    fun sendMusicTrackToCluster(songTitle: String) {
+        val cleaned = songTitle.replace(Regex("[^\\x20-\\x7E]"), "").trim().ifEmpty { "Midnight City" }.take(IqubeBleSpec.MAX_LOCATION_ASCII_BYTES)
+        _musicTrackTitle.value = cleaned
+        commandDispatcher.enqueueCommand(
+            label = "Music Track [b $cleaned (0x5B 0x62)",
+            rawPayload = commandDispatcher.buildMusicTrackPacket(cleaned)
+        )
+    }
+
+    fun syncRiderGreetingToCluster(riderName: String) {
+        val cleaned = riderName.replace(Regex("[^\\x20-\\x7E]"), "").trim().ifEmpty { "Rider" }.take(IqubeBleSpec.MAX_LOCATION_ASCII_BYTES)
+        _riderGreetingName.value = cleaned
+        tripRepository.saveRiderName(cleaned)
+        commandDispatcher.enqueueCommand(
+            label = "Rider Greeting [R Hello $cleaned (0x5B 0x52)",
+            rawPayload = commandDispatcher.buildRiderNamePacket(cleaned)
         )
     }
 

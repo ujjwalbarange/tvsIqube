@@ -91,6 +91,9 @@ class ExampleUnitTest {
         assertEquals(0x54.toByte(), stateAfter7D.latestFrame0x7D?.get(2))
 
         // 4. 0x5A 0x11 Trip A (00 00 03 = 0.3 km), Byte 5 = 0x01 (Charging), Byte 6 = 42% mirror, Trip B (00 00 0A = 1.0 km)
+        // First reset speed to 0 km/h and send 0x13 with Byte 5 = 0x06 so both 0x13 and 0x11 confirm charging while stationary
+        parser.ingestRawChunk(HciLogReplayDataset.buildSpeedOdometerFrame0x10(0, 359252), 7500L)
+        parser.ingestRawChunk(HciLogReplayDataset.buildBatteryRangeFrame0x13(42, 450, true), 7800L)
         parser.ingestRawChunk(
             HciLogReplayDataset.buildTripsAndChargingFrame0x11(
                 tripATenthsKm = 3,
@@ -116,15 +119,28 @@ class ExampleUnitTest {
             onWriteAckTimeout = {}
         )
 
-        // 1. Handshake [RU (0x5B, 0x52, 0x55, 0x01, ..."IQUBE_OSS", ...0x00, 0xFF)
+        // 1. Handshake [RU & Phone Battery/Signal Status Relay (0x5B, 0x52, 0x55, ...)
         val handshake = dispatcher.buildInitialHandshakeFrame()
         assertEquals(20, handshake.size)
         assertEquals(0xFF.toByte(), handshake[19])
         assertTrue(dispatcher.validateOutgoingFrame(handshake).isSuccess)
 
-        // 2. Clock Heartbeat [JD (0x5B, 0x4A, 0x44, hh, mm, ss, 0x01, ...0x00, 0xFF)
-        val heartbeat = dispatcher.buildHeartbeatSyncFrame()
+        val phoneStatus = dispatcher.buildPhoneStatusPacket(batteryPct = 88, signalBars = 4)
+        assertEquals(0x5B.toByte(), phoneStatus[0])
+        assertEquals(0x52.toByte(), phoneStatus[1])
+        assertEquals(0x55.toByte(), phoneStatus[2])
+        assertEquals(88.toByte(), phoneStatus[3])
+        assertEquals(4.toByte(), phoneStatus[4])
+        assertEquals(0x01.toByte(), phoneStatus[5])
+        assertEquals(0xFF.toByte(), phoneStatus[19])
+        assertTrue(dispatcher.validateOutgoingFrame(phoneStatus).isSuccess)
+
+        // 2. Clock & Date Sync Heartbeat [JD (0x5B, 0x4A, 0x44, hh, mm, ss, 0x01, DD, MM, YY, ..., 0xFF)
+        val heartbeat = dispatcher.buildClockSyncPacket()
         assertEquals(20, heartbeat.size)
+        assertEquals(0x01.toByte(), heartbeat[6])
+        assertTrue(heartbeat[7] in 1..31)
+        assertTrue(heartbeat[8] in 1..12)
         assertEquals(0xFF.toByte(), heartbeat[19])
         assertTrue(dispatcher.validateOutgoingFrame(heartbeat).isSuccess)
 
@@ -171,16 +187,22 @@ class ExampleUnitTest {
         assertEquals(0xFF.toByte(), callStatePkt[19])
         assertTrue(dispatcher.validateOutgoingFrame(callStatePkt).isSuccess)
 
-        // 6. Turn-by-Turn Navigation 2-Packet Sequence (0x5B 0x49 + 0x5B 0x4E)
-        val navPkt1 = dispatcher.buildNavigationManeuverPacket1(TurnTypeConstant.TURN_RIGHT.code, 250, 0x01)
-        assertEquals(0x5B.toByte(), navPkt1[0])
-        assertEquals(0x49.toByte(), navPkt1[1])
-        assertEquals(0x03.toByte(), navPkt1[2]) // Turn Right = 0x03 in TurnTypeConstants.smali
-        assertEquals(0x00.toByte(), navPkt1[3])
-        assertEquals(250.toByte(), navPkt1[4])
-        assertEquals(0x01.toByte(), navPkt1[5])
-        assertEquals(0xFF.toByte(), navPkt1[19])
-        assertTrue(dispatcher.validateOutgoingFrame(navPkt1).isSuccess)
+        // 6. Turn-by-Turn Navigation 2-Packet Sequence (0x5B 0x49 + 0x5B 0x4E) with auto m/km scaling + ETA
+        val navPkt1Meters = dispatcher.buildNavigationManeuverPacket1(TurnTypeConstant.TURN_RIGHT.code, 250, 0x01, etaMinutes = 75)
+        assertEquals(0x5B.toByte(), navPkt1Meters[0])
+        assertEquals(0x49.toByte(), navPkt1Meters[1])
+        assertEquals(0x03.toByte(), navPkt1Meters[2]) // Turn Right = 0x03 in TurnTypeConstants.smali
+        assertEquals(0x00.toByte(), navPkt1Meters[3])
+        assertEquals(250.toByte(), navPkt1Meters[4])
+        assertEquals(0x01.toByte(), navPkt1Meters[5]) // Meters
+        assertEquals(1.toByte(), navPkt1Meters[6])    // ETA Hours (75 / 60 = 1)
+        assertEquals(15.toByte(), navPkt1Meters[7])   // ETA Mins (75 % 60 = 15)
+        assertEquals(0xFF.toByte(), navPkt1Meters[19])
+        assertTrue(dispatcher.validateOutgoingFrame(navPkt1Meters).isSuccess)
+
+        val navPkt1Km = dispatcher.buildNavigationManeuverPacket1(TurnTypeConstant.CONTINUE_STRAIGHT.code, 1400, 0x01, etaMinutes = 12)
+        assertEquals(0x02.toByte(), navPkt1Km[5]) // Auto-scaled to 0x02 (0.1 km units)
+        assertEquals(14.toByte(), navPkt1Km[4])   // 1400m = 1.4 km = 14 tenths
 
         val navPkt2 = dispatcher.buildNavigationStreetPacket2(TurnTypeConstant.TURN_RIGHT.code, "MG Road")
         assertEquals(0x5B.toByte(), navPkt2[0])
@@ -191,7 +213,22 @@ class ExampleUnitTest {
         assertEquals(0xFF.toByte(), navPkt2[19])
         assertTrue(dispatcher.validateOutgoingFrame(navPkt2).isSuccess)
 
-        // 7. Reject packet missing 0xFF at Byte 19
+        // 7. Music Track Title Banner (SONG_NAME_PACKET 0x5B 0x62) & Rider Greeting Name (0x5B 0x52)
+        val musicPkt = dispatcher.buildMusicTrackPacket("Midnight City")
+        assertEquals(0x5B.toByte(), musicPkt[0])
+        assertEquals(0x62.toByte(), musicPkt[1])
+        assertEquals("Midnight City", String(musicPkt, 2, 13, StandardCharsets.US_ASCII))
+        assertEquals(0xFF.toByte(), musicPkt[19])
+        assertTrue(dispatcher.validateOutgoingFrame(musicPkt).isSuccess)
+
+        val riderPkt = dispatcher.buildRiderNamePacket("Aarav")
+        assertEquals(0x5B.toByte(), riderPkt[0])
+        assertEquals(0x52.toByte(), riderPkt[1])
+        assertEquals("Aarav", String(riderPkt, 2, 5, StandardCharsets.US_ASCII))
+        assertEquals(0xFF.toByte(), riderPkt[19])
+        assertTrue(dispatcher.validateOutgoingFrame(riderPkt).isSuccess)
+
+        // 8. Reject packet missing 0xFF at Byte 19
         val missingTrailer = locationPkt.copyOf()
         missingTrailer[19] = 0x00
         assertTrue(dispatcher.validateOutgoingFrame(missingTrailer).isFailure)
@@ -199,7 +236,7 @@ class ExampleUnitTest {
 
     @Test
     fun chargingPredictorAndTrueRangeEngine_computeAccuratePredictions() {
-        // 1. Tier 1 Default Charging Baseline (2h 45m for 0-80% = 123.75s per 1%)
+        // 1. Tier 1 Default Charging Baseline (2h 45m for 0-80% = 123.75s per 1%, 80-100% taper = 180s per 1%)
         val defaultChg = TrueRangeAndTripRepository.computeChargingMonitorState(
             isCharging = true,
             currentBatteryPct = 40,
@@ -210,7 +247,8 @@ class ExampleUnitTest {
         )
         assertFalse(defaultChg.isUsingLiveStepTiming)
         assertEquals(123.75, defaultChg.activeSecondsPerPct, 0.01)
-        assertEquals(4950L, defaultChg.remainingSecondsTo80) // (80 - 40) * 123.75 = 4950s
+        assertEquals(4950L, defaultChg.remainingSecondsTo80)  // (80 - 40) * 123.75 = 4950s
+        assertEquals(8550L, defaultChg.remainingSecondsTo100) // 4950s + (20 * 180s) = 8550s
 
         // 2. Tier 3 Live 1% Step Timing (115.7s per +1% = +31.1%/hr from charging capture)
         val liveChg = TrueRangeAndTripRepository.computeChargingMonitorState(
@@ -224,7 +262,8 @@ class ExampleUnitTest {
         assertTrue(liveChg.isUsingLiveStepTiming)
         assertEquals(115.7, liveChg.activeSecondsPerPct, 0.1)
         assertEquals(31.1, liveChg.chargingSpeedPctPerHour, 0.1)
-        assertEquals(4397L, liveChg.remainingSecondsTo80) // (80 - 42) * 115.7 = 4396.6 -> 4397s
+        assertEquals(4397L, liveChg.remainingSecondsTo80)  // (80 - 42) * 115.7 = 4396.6 -> 4397s
+        assertEquals(7997L, liveChg.remainingSecondsTo100) // 4396.6 + (20 * 180) = 7996.6 -> 7997s
 
         // 3. True Range Engine Baseline (1.00 km/% Eco, 0.75 km/% Power) & Learned
         val baselineRange = TrueRangeAndTripRepository.computeTrueRange(

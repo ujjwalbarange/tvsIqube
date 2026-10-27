@@ -98,6 +98,8 @@ fun IqubeCompanionApp(
     val lastSeenState by viewModel.lastSeenState.collectAsStateWithLifecycle()
     val incomingCallState by viewModel.incomingCallState.collectAsStateWithLifecycle()
     val navigationState by viewModel.navigationState.collectAsStateWithLifecycle()
+    val riderGreetingName by viewModel.riderGreetingName.collectAsStateWithLifecycle()
+    val musicTrackTitle by viewModel.musicTrackTitle.collectAsStateWithLifecycle()
     val selectedRangeMode by viewModel.selectedRangeMode.collectAsStateWithLifecycle()
     val savedTrips by viewModel.savedTrips.collectAsStateWithLifecycle()
     val activeTripSession by viewModel.activeTripSession.collectAsStateWithLifecycle()
@@ -218,7 +220,12 @@ fun IqubeCompanionApp(
                                     onSendNavigationManeuver = viewModel::sendNavigationManeuver,
                                     onToggleNavigationRouteSim = viewModel::toggleNavigationRouteSimulation,
                                     onSimulateChargingStepClick = viewModel::simulateLiveOnePercentChargingStep,
-                                    onToggleChargingClick = viewModel::toggleReplayChargingState
+                                    onToggleChargingClick = viewModel::toggleReplayChargingState,
+                                    riderGreetingName = riderGreetingName,
+                                    musicTrackTitle = musicTrackTitle,
+                                    onSendMusicTrackClick = viewModel::sendMusicTrackToCluster,
+                                    onSyncRiderGreetingClick = viewModel::syncRiderGreetingToCluster,
+                                    onSendPhoneStatusRelayClick = viewModel::sendPhoneStatusRelayNow
                                 )
                             }
                             DashboardDestination.SAVED_TRIPS -> {

@@ -50,6 +50,11 @@ class IqubePacketParser {
     private var sprintLatched30: Double? = null
     private var sprintLatched40: Double? = null
 
+    // Strict Debounced Charging State Tracking (0x11 Byte 5 == 0x01 AND 0x13 Byte 5 == 0x06 while speed == 0)
+    private var chargingDebounceCount: Int = 0
+    private var latest0x13Is0x06: Boolean? = null
+    private var latest0x11Is0x01: Boolean? = null
+
     fun updateByteOffsetMapping(newMapping: ByteOffsetMapping) {
         _byteOffsetMapping.value = newMapping
         val current = _telemetryState.value
@@ -87,6 +92,9 @@ class IqubePacketParser {
             lastSpeedPacketTimeMs = null
             lastSpeedKmh = 0
             sprintStartTimeMs = null
+            chargingDebounceCount = 0
+            latest0x13Is0x06 = null
+            latest0x11Is0x01 = null
             _telemetryState.value = TelemetryState()
         }
     }
@@ -242,12 +250,19 @@ class IqubePacketParser {
 
         lastSpeedKmh = speedKmh
 
+        // If speed > 0, immediately latch isCharging = false and reset chargingDebounceCount
+        if (speedKmh > 0) {
+            chargingDebounceCount = 0
+        }
+
         _telemetryState.update { prev ->
             val newDistMeters = prev.integratedDistanceMeters + deltaMeters
             val clusterStepKm = floor(newDistMeters / 100.0) / 10.0
+            val effectiveCharging = if (speedKmh > 0) false else prev.isCharging
             val mode = when {
-                prev.isCharging -> RideMode.CHARGING
+                effectiveCharging -> RideMode.CHARGING
                 speedKmh >= 38 -> RideMode.POWER
+                prev.rideMode == RideMode.CHARGING -> RideMode.ECO
                 else -> prev.rideMode ?: RideMode.ECO
             }
             prev.copy(
@@ -260,6 +275,7 @@ class IqubePacketParser {
                 sprint0To40Sec = sprintLatched40 ?: prev.sprint0To40Sec,
                 isSprintTimerRunning = sprintStartTimeMs != null && speedKmh < 40,
                 odometerKm = if (totalOdoKm > 0.0) totalOdoKm else prev.odometerKm,
+                isCharging = effectiveCharging,
                 isRegenActive = isRegen,
                 rideMode = mode,
                 isIgnitionUnlocked = true,
@@ -298,18 +314,40 @@ class IqubePacketParser {
         val flagIdx = mapping.stateFlagOffsetIn0x13.coerceIn(3, frame.size - 2)
         val stateFlagByte5 = frame[flagIdx].toInt() and 0xFF
         val isCharging0x06 = stateFlagByte5 == (IqubeBleSpec.FLAG_0X13_CHARGING_MODE.toInt() and 0xFF)
+        latest0x13Is0x06 = isCharging0x06
 
         val derivedVolts = ((44.8f + (socPercent / 100f) * 8.4f) * 10f).roundToInt() / 10f
 
+        // Strict Debounced Charging State Logic:
+        // If 0x13 Byte 5 !== 0x06 OR 0x11 Byte 5 === 0x00 OR speed > 0 -> immediately latch isCharging = false.
+        // When charging flags are active while speed == 0, apply 3-frame hysteresis (or both 0x13==0x06 and 0x11==0x01 confirmed).
+        val debouncedCharging: Boolean = if (!isCharging0x06 || latest0x11Is0x01 == false || lastSpeedKmh > 0) {
+            chargingDebounceCount = 0
+            false
+        } else {
+            chargingDebounceCount++
+            val bothConfirmed = (latest0x13Is0x06 == true && latest0x11Is0x01 == true)
+            bothConfirmed || chargingDebounceCount >= IqubeBleSpec.CHARGING_DEBOUNCE_FRAMES || (latest0x11Is0x01 == null && chargingDebounceCount >= 1)
+        }
+
+        // Auto Ride Mode Detection from Cluster BMS DTE (0x13 Bytes 3..4) vs SoC:
+        // Eco mode BMS DTE is ~1.05 km/%; Power mode BMS DTE drops sharply (< 0.86 km/%).
+        val dteRatio = if (socPercent >= 15) (clusterRangeKm / socPercent.toDouble()) else 1.05
+
         _telemetryState.update { prev ->
-            // Strict Charging State Logic:
-            // If frameType === 0x13 && d[5] === 0x06 -> true; if d[5] !== 0x06 -> immediately false
+            val inferredMode = when {
+                debouncedCharging -> RideMode.CHARGING
+                dteRatio < 0.86 -> RideMode.POWER
+                dteRatio >= 0.92 && lastSpeedKmh < 38 -> RideMode.ECO
+                prev.rideMode == RideMode.CHARGING -> RideMode.ECO
+                else -> prev.rideMode ?: RideMode.ECO
+            }
             prev.copy(
                 batteryPercent = socPercent,
                 clusterRangeKm = clusterRangeKm,
                 stateFlag0x13Byte5 = stateFlagByte5,
-                isCharging = isCharging0x06,
-                rideMode = if (isCharging0x06) RideMode.CHARGING else (if (prev.rideMode == RideMode.CHARGING) RideMode.ECO else (prev.rideMode ?: RideMode.ECO)),
+                isCharging = debouncedCharging,
+                rideMode = inferredMode,
                 packVoltageVolts = derivedVolts,
                 latestFrame0x13 = frame.copyOf(),
                 packetCount0x13 = if (incrementCounter) prev.packetCount0x13 + 1 else prev.packetCount0x13,
@@ -348,20 +386,30 @@ class IqubePacketParser {
         val tripAKm = readUInt24BE(frame, tripAIdx) / 10.0
         val chargingFlagByte5 = frame[chgIdx].toInt() and 0xFF
         val isCharging0x01 = chargingFlagByte5 == (IqubeBleSpec.FLAG_0X11_CHARGING_ACTIVE.toInt() and 0xFF)
+        latest0x11Is0x01 = isCharging0x01
         val socMirror = (frame[socMirrorIdx].toInt() and 0xFF).coerceIn(0, 100)
         val tripBKm = readUInt24BE(frame, tripBIdx) / 10.0
 
+        // Strict Debounced Charging State Logic:
+        // If 0x11 Byte 5 === 0x00 OR 0x13 Byte 5 !== 0x06 OR speed > 0 -> immediately latch isCharging = false.
+        val debouncedCharging: Boolean = if (!isCharging0x01 || latest0x13Is0x06 == false || lastSpeedKmh > 0) {
+            chargingDebounceCount = 0
+            false
+        } else {
+            chargingDebounceCount++
+            val bothConfirmed = (latest0x13Is0x06 == true && latest0x11Is0x01 == true)
+            bothConfirmed || chargingDebounceCount >= IqubeBleSpec.CHARGING_DEBOUNCE_FRAMES || (latest0x13Is0x06 == null && chargingDebounceCount >= 1)
+        }
+
         _telemetryState.update { prev ->
-            // Strict Charging State Logic:
-            // If frameType === 0x11 && d[5] === 0x01 -> true; if d[5] === 0x00 -> immediately false
             prev.copy(
                 tripAKm = tripAKm,
                 tripBKm = tripBKm,
                 chargingFlag0x11Byte5 = chargingFlagByte5,
                 socMirror0x11 = socMirror,
                 batteryPercent = prev.batteryPercent ?: (if (socMirror > 0) socMirror else null),
-                isCharging = isCharging0x01,
-                rideMode = if (isCharging0x01) RideMode.CHARGING else (if (prev.rideMode == RideMode.CHARGING) RideMode.ECO else (prev.rideMode ?: RideMode.ECO)),
+                isCharging = debouncedCharging,
+                rideMode = if (debouncedCharging) RideMode.CHARGING else (if (prev.rideMode == RideMode.CHARGING) RideMode.ECO else (prev.rideMode ?: RideMode.ECO)),
                 lastOdometerSyncMs = timestampMs,
                 latestFrame0x11 = frame.copyOf(),
                 packetCount0x11 = if (incrementCounter) prev.packetCount0x11 + 1 else prev.packetCount0x11,

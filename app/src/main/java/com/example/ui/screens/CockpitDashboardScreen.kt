@@ -124,6 +124,11 @@ fun CockpitDashboardScreen(
     onToggleNavigationRouteSim: () -> Unit,
     onSimulateChargingStepClick: () -> Unit,
     onToggleChargingClick: () -> Unit,
+    riderGreetingName: String = "Rider",
+    musicTrackTitle: String = "Midnight City",
+    onSendMusicTrackClick: (String) -> Unit = {},
+    onSyncRiderGreetingClick: (String) -> Unit = {},
+    onSendPhoneStatusRelayClick: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val scrollState = rememberScrollState()
@@ -220,6 +225,15 @@ fun CockpitDashboardScreen(
                 detectedLocalityName = detectedLocalityName,
                 onTriggerCall = onTriggerIncomingCallClick,
                 onEndCall = onEndIncomingCallClick
+            )
+
+            // 8. MUSIC TRACK BANNER (`0x5B 0x62`), RIDER GREETING (`0x5B 0x52`) & PHONE BATTERY/SIGNAL RELAY (`0x5B 0x52 0x55`)
+            ClusterMusicAndRiderGreetingCard(
+                riderGreetingName = riderGreetingName,
+                musicTrackTitle = musicTrackTitle,
+                onSendMusicTrackClick = onSendMusicTrackClick,
+                onSyncRiderGreetingClick = onSyncRiderGreetingClick,
+                onSendPhoneStatusRelayClick = onSendPhoneStatusRelayClick
             )
 
             Spacer(modifier = Modifier.height(12.dp))
@@ -1608,3 +1622,98 @@ private fun CommandShortcutButton(
         }
     }
 }
+
+@Composable
+private fun ClusterMusicAndRiderGreetingCard(
+    riderGreetingName: String,
+    musicTrackTitle: String,
+    onSendMusicTrackClick: (String) -> Unit,
+    onSyncRiderGreetingClick: (String) -> Unit,
+    onSendPhoneStatusRelayClick: () -> Unit
+) {
+    var riderInput by remember(riderGreetingName) { mutableStateOf(riderGreetingName) }
+    var songInput by remember(musicTrackTitle) { mutableStateOf(musicTrackTitle) }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(18.dp))
+            .background(SlateSurface)
+            .border(1.dp, SlateBorder, RoundedCornerShape(18.dp))
+            .padding(16.dp)
+            .testTag("music_rider_greeting_card"),
+        verticalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = "RIDER GREETING (0x5B 0x52) • MUSIC TRACK (0x5B 0x62) • PHONE STATUS (0x5B 0x52 0x55)",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = ElectricCyan
+                )
+                Text(
+                    text = "Greeting: \"Hello ${riderInput.ifBlank { "Rider" }}\" • Track: \"${songInput.ifBlank { "Midnight City" }}\"",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = TextSecondary
+                )
+            }
+            OutlinedButton(
+                onClick = onSendPhoneStatusRelayClick,
+                modifier = Modifier.testTag("sync_phone_status_button")
+            ) {
+                Text("Sync Phone [RU", color = NeonMint, style = MaterialTheme.typography.labelSmall)
+            }
+        }
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            OutlinedTextField(
+                value = riderInput,
+                onValueChange = { riderInput = it.take(IqubeBleSpec.MAX_LOCATION_ASCII_BYTES) },
+                label = { Text("Rider Name (0x5B 0x52 'Hello <Name>')") },
+                singleLine = true,
+                modifier = Modifier
+                    .weight(1f)
+                    .testTag("rider_greeting_input")
+            )
+            Button(
+                onClick = { onSyncRiderGreetingClick(riderInput) },
+                colors = ButtonDefaults.buttonColors(containerColor = ElectricCyan, contentColor = SlateSurface),
+                modifier = Modifier.testTag("sync_rider_greeting_button")
+            ) {
+                Text("Sync Name", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
+            }
+        }
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            OutlinedTextField(
+                value = songInput,
+                onValueChange = { songInput = it.take(IqubeBleSpec.MAX_LOCATION_ASCII_BYTES) },
+                label = { Text("Music Track Title (SONG_NAME_PACKET 0x5B 0x62)") },
+                singleLine = true,
+                modifier = Modifier
+                    .weight(1f)
+                    .testTag("music_track_input")
+            )
+            Button(
+                onClick = { onSendMusicTrackClick(songInput) },
+                colors = ButtonDefaults.buttonColors(containerColor = NeonMint, contentColor = SlateSurface),
+                modifier = Modifier.testTag("send_music_track_button")
+            ) {
+                Text("Push Song", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
+            }
+        }
+    }
+}
+

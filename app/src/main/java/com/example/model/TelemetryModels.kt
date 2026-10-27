@@ -42,9 +42,10 @@ object IqubeBleSpec {
     const val DATA_ID_NAV_MANEUVER_49: Byte = 0x49 // 'I' — Navigation Maneuver & Distance (0x5B 0x49)
     const val DATA_ID_HEARTBEAT_4A: Byte = 0x4A  // 'J' — Clock Sync Heartbeat [JD (0x5B 0x4A 0x44)
     const val DATA_ID_NAV_ASSIST_4E: Byte = 0x4E // 'N' — Navigation Street / Dest Reached (0x5B 0x4E)
-    const val DATA_ID_HANDSHAKE_52: Byte = 0x52  // 'R' — Handshake [RU (0x5B 0x52 0x55)
+    const val DATA_ID_HANDSHAKE_52: Byte = 0x52  // 'R' — Handshake [RU (0x5B 0x52 0x55) & Rider Greeting (0x5B 0x52)
     const val DATA_ID_LOCATION_5C: Byte = 0x5C   // '\' — GPS Locality Text (0x5B 0x5C)
     const val DATA_ID_CALL_STATE_5D: Byte = 0x5D // ']' — writeCallStateForIQube (0x5B 0x5D 0x43)
+    const val SONG_NAME_PACKET: Byte = 0x62      // 'b' — Music Track Title Banner (0x5B 0x62)
 
     // Verified Trip Subcommands for createVehicleDataArray (0x5A 0xF1 0x00 <tripVal> ... 0xFF):
     const val SUBCMD_SWITCH_TRIP_A: Byte = 0x00
@@ -65,6 +66,7 @@ object IqubeBleSpec {
     const val FLAG_0X11_CHARGING_ACTIVE: Byte = 0x01
     const val VERIFIED_CAPTURE_SEC_PER_PCT = 115.7   // +31.1% / hr from btsnoop_hci.log charging capture
     const val DEFAULT_0_TO_80_SEC_PER_PCT = 123.75   // 2 hr 45 min (9,900s) for 0% -> 80%
+    const val DEFAULT_80_TO_100_SEC_PER_PCT = 180.0  // 3 min (180s) per 1% taper for 80% -> 100%
     const val DEFAULT_CHARGING_SEC_PER_PCT = 123.75
 
     // Link, FIFO Spacing & Timing Constants
@@ -122,7 +124,8 @@ enum class TurnTypeConstant(val code: Int, val title: String, val symbol: String
 data class NavigationManeuverState(
     val selectedTurn: TurnTypeConstant = TurnTypeConstant.TURN_LEFT,
     val distanceMeters: Int = 250,
-    val unitByte: Int = 0x01, // 0x01 = meters (m), 0x02 = kilometers (km)
+    val unitByte: Int = 0x01, // 0x01 = meters (m), 0x02 = kilometers (0.1 km units)
+    val etaMinutes: Int = 12,
     val streetName: String = "Wardha Rd",
     val isRouteSimulationRunning: Boolean = false,
     val currentRouteStepIndex: Int = 0,

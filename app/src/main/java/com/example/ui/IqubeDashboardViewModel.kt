@@ -62,6 +62,8 @@ class IqubeDashboardViewModel(application: Application) : AndroidViewModel(appli
     val lastSeenState: StateFlow<LastSeenScooterState?> = bleManager.lastSeenState
     val incomingCallState: StateFlow<IncomingCallRelayState> = bleManager.incomingCallState
     val navigationState: StateFlow<NavigationManeuverState> = bleManager.navigationState
+    val riderGreetingName: StateFlow<String> = bleManager.riderGreetingName
+    val musicTrackTitle: StateFlow<String> = bleManager.musicTrackTitle
     val selectedRangeMode: StateFlow<RideMode> = bleManager.selectedRangeMode
     val savedTrips: StateFlow<List<SavedTripRecord>> = bleManager.tripRepository.savedTrips
     val activeTripSession: StateFlow<ActiveTripSession?> = bleManager.activeTripSession
@@ -153,6 +155,19 @@ class IqubeDashboardViewModel(application: Application) : AndroidViewModel(appli
 
     fun toggleNavigationRouteSimulation() {
         bleManager.toggleNavigationRouteSimulation()
+    }
+
+    // Music Track Banner (`0x5B 0x62`), Rider Greeting (`0x5B 0x52`), & Phone Status (`0x5B 0x52 0x55`)
+    fun sendMusicTrackToCluster(songTitle: String) {
+        bleManager.sendMusicTrackToCluster(songTitle)
+    }
+
+    fun syncRiderGreetingToCluster(riderName: String) {
+        bleManager.syncRiderGreetingToCluster(riderName)
+    }
+
+    fun sendPhoneStatusRelayNow() {
+        bleManager.sendPhoneStatusRelayNow()
     }
 
     // Charging Predictor Actions
